@@ -9,6 +9,9 @@ from lsst.pipe.base import connectionTypes
 from lsst.meas.algorithms import MaskStreaksTask
 from lsst.meas.algorithms.maskStreaks import LineCollection
 
+from lsst.geom import Point2I
+import cv2
+
 class StreakFinderConfig(pexConfig.Config):
     """Configurable parameters for StreakFinderTask.
     """
@@ -129,11 +132,14 @@ class StreakFinderTask(pipeBase.Task):
             if aspect_ratio > aspect:
                 long_labels.append(i)
     
-        c, r = arr.shape
+        r, c = arr.shape # Debugging code: swapped c, r to r, c
         # Fit lines to the longest ones
         rhos = []
         thetas = []
         lines = LineCollection([], [])
+
+        test_lines = [] ## Debugging code
+
         for label in long_labels:
             mask = np.uint8(labels == label)
             # Extract points (x,y) of this component
@@ -151,6 +157,15 @@ class StreakFinderTask(pipeBase.Task):
             limit = self.config.limit
             if (abs(vx) < limit) or (abs(vy) < limit):
                 continue
+
+            ## Debugging code
+            # Find points at the edges
+            alpha = min((r - 1 - x0) / vx, (c - 1 - y0) / vy)
+            right_point = (int(x0 + alpha * vx), int(y0 + alpha * vy))
+            beta = min(x0 / vx , y0 / vy)
+            left_point = (int(x0 - beta * vx), int(y0 - beta * vy))
+            test_lines.append([Point2I(left_point), Point2I(right_point)])
+            print(left_point, right_point)
                 
             # Now find rho, theta for lsst.meas.algorithms.maskStreaks.Line class
             theta = -np.atan2(vx, vy)
@@ -160,10 +175,16 @@ class StreakFinderTask(pipeBase.Task):
             thetas.append(theta)
             lines = LineCollection(np.array(rhos), np.array(thetas))
 
+        disp_img = np.zeros_like(arr)
+        for [left_point, right_point] in test_lines:
+            cv2.line(disp_img, left_point, \
+                     right_point, (255,255,255), 50)
+
         return pipeBase.Struct(
             lines=lines,
             minima_ridges=minima_ridges,
             binary_ridges=binary_ridges,
+            disp_img=disp_img
         )
 
 class DetectStreaksTaskConnections(pipeBase.PipelineTaskConnections,
@@ -192,13 +213,13 @@ class DetectStreaksTaskConfig(pipeBase.PipelineTaskConfig,
         default="canny-hough",
         doc="Line detection algorithm to use.",
         allowed={
-            "canny-hough" : "Canny edge and Hough transform.",
+            "kht" : "Kernel Hough transform.",
             "hessian" : "Hessian matrix.",
         }
     )
     maskStreaks = pexConfig.ConfigurableField(
         target=MaskStreaksTask,
-        doc="Detect streaks using Canny edge and Kernel Hough Transform."
+        doc="Detect streaks using Kernel Hough transform."
     )
     streakFinder = pexConfig.ConfigurableField(
         target=StreakFinderTask,
@@ -219,7 +240,7 @@ class DetectStreaksTask(pipeBase.PipelineTask):
     @timeMethod
     def run(self, exposure):
 
-        if self.config.detectionAlgorithm == 'canny-hough':
+        if self.config.detectionAlgorithm == 'kht':
             detectedLineResults = self.maskStreaks.run(exposure.getMaskedImage())
         elif self.config.detectionAlgorithm == 'hessian':
             detectedLineResults = self.streakFinder.run(exposure)

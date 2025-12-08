@@ -1,0 +1,7 @@
+description: mixcoatl kht streak detection
+tasks:
+  detectStreaks:
+    class: mixcoatl.detectStreaks.DetectStreaksTask
+    config:
+      connections.exposure: 'preliminary_visit_image'
+      detectionAlgorithm: "hessian"
