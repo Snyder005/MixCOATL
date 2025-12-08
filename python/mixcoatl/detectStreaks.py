@@ -170,7 +170,10 @@ class StreakFinderTask(pipeBase.Task):
             # Now find rho, theta for lsst.meas.algorithms.maskStreaks.Line class
             theta = -np.atan2(vx, vy)
             rho = (x0 - c/2) * np.cos(theta) + (y0 - r/2) * np.sin(theta)
-            theta *= 180.0 / np.pi # Comvert to degrees
+            theta *= 180.0 / np.pi # Convert to degrees
+            if theta < 0.:
+                rho *= -1
+                theta += 180.
             rhos.append(rho)
             thetas.append(theta)
             lines = LineCollection(np.array(rhos), np.array(thetas))
