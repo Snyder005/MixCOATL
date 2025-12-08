@@ -1,0 +1,10 @@
+description: LSST-UCDCam crosstalk measurement from spots
+instrument: lsst.obs.lsst.LsstUCDCam
+imports:
+  - location: $MIXCOATL_DIR/pipelines/_ingredients/mixCrosstalkSpot.yaml
+tasks:
+  cpCrosstalkIsr:
+    class: lsst.ip.isr.IsrTaskLSST
+    config:
+      doCorrectGains: False
+      useGainsFrom: "PTC"

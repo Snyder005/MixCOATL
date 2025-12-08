@@ -210,7 +210,7 @@ class DetectStreaksTaskConfig(pipeBase.PipelineTaskConfig,
     """
     detectionAlgorithm = pexConfig.ChoiceField(
         dtype=str,
-        default="canny-hough",
+        default="kht",
         doc="Line detection algorithm to use.",
         allowed={
             "kht" : "Kernel Hough transform.",
