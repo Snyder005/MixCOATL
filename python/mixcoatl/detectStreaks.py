@@ -5,8 +5,7 @@ import numpy as np
 import lsst.pex.config as pexConfig
 import lsst.pipe.base as pipeBase
 import lsst.afw.image as afwImage
-from lsst.utils.timer import timeMethod
-from lsst.pipe.base import connectionTypes
+import lsst.pipe.base.connectionTypes as cT
 from lsst.meas.algorithms import MaskStreaksTask
 from lsst.meas.algorithms.maskStreaks import LineCollection
 from lsst.geom import Point2I
@@ -177,16 +176,10 @@ class StreakFinderTask(pipeBase.Task):
             thetas.append(theta)
             lines = LineCollection(np.array(rhos), np.array(thetas))
 
-        disp_img = np.zeros_like(arr)
-        for [left_point, right_point] in test_lines:
-            cv2.line(disp_img, left_point, \
-                     right_point, (255,255,255), 50)
-
         return pipeBase.Struct(
             lines=lines,
             minima_ridges=minima_ridges,
             binary_ridges=binary_ridges,
-            disp_img=disp_img
         )
 
 class DetectStreaksTaskConnections(pipeBase.PipelineTaskConnections,
@@ -198,7 +191,6 @@ class DetectStreaksTaskConnections(pipeBase.PipelineTaskConnections,
         storageClass="Exposure",
         dimensions=("instrument", "visit", "detector"),
     )
-
     detectedLines = connectionTypes.Output(
         doc="Lines detected in the input exposure.",
         name="detected_lines",
@@ -221,7 +213,6 @@ class DetectStreaksTaskConnections(pipeBase.PipelineTaskConnections,
         storageClass="Image",
         dimensions=("instrument", "visit", "detector"),
     )
-
     binaryRidges = connectionTypes.Output(
         doc="Detected ridges image.",
         name="binary_ridges",
@@ -259,20 +250,46 @@ class DetectStreaksTaskConfig(pipeBase.PipelineTaskConfig,
         doc="Detect streaks using Hessian matrix line detection."
     )
 
+
 class DetectStreaksTask(pipeBase.PipelineTask):
+    """Find streaks or other straight lines in the image.
+    """
 
     ConfigClass = DetectStreaksTaskConfig
     _DefaultName = "detectStreaks"
 
     def __init__(self, **kwargs):
-
         super().__init__(**kwargs)
         self.makeSubtask('maskStreaks')
         self.makeSubtask('streakFinder')
 
-    @timeMethod
     def run(self, exposure):
+        """Find streaks in the image.
 
+        Find streaks in a background subtracted image using either a Kernal 
+        Hough Transform or a Hessian matrix line detection.
+
+        Parameters
+        ----------
+        exposure : `lsst.afw.image.Exposure`
+            A background subtracted exposure.
+
+        Returns
+        -------
+        result : `lsst.pipe.base.Struct`
+            Results as a struct with attributes:
+
+            ``lines``
+                Final results for lines. (`dict`)
+            ``originalLines``
+                Lines identified by the kernel hough transform. (`dict`)
+            ``minimaRidges``
+                The image of minima ridges output by the Hessian matrix. 
+                (`lsst.afw.image.Image`)
+            ``binaryRidges``
+                The mask of minima ridges below the detection threshold. 
+                (`lsst.afw.image.Mask`)
+        """
         result = pipeBase.Struct(
             detectedLines=None,
             originalLines=None,
