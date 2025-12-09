@@ -65,7 +65,6 @@ class StreakFinderTask(pipeBase.Task):
     ConfigClass = StreakFinderConfig
     _DefaultName = "streakFinder"
 
-    @timeMethod
     def run(self, exposure):
 
         arr = exposure.getImage().getArray()    
@@ -163,7 +162,6 @@ class StreakFinderTask(pipeBase.Task):
             beta = min(x0 / vx , y0 / vy)
             left_point = (int(x0 - beta * vx), int(y0 - beta * vy))
             test_lines.append([Point2I(left_point), Point2I(right_point)])
-            print(left_point, right_point)
                 
             # Now find rho, theta for lsst.meas.algorithms.maskStreaks.Line class
             theta = -np.atan2(vx, vy)
@@ -185,13 +183,13 @@ class StreakFinderTask(pipeBase.Task):
 class DetectStreaksTaskConnections(pipeBase.PipelineTaskConnections,
                                    dimensions=("instrument", "visit", "detector")):
 
-    exposure = connectionTypes.Input(
+    exposure = cT.Input(
         doc="Background-subtracted exposure to detect streaks on.",
         name="preliminary_visit_image",
         storageClass="Exposure",
         dimensions=("instrument", "visit", "detector"),
     )
-    detectedLines = connectionTypes.Output(
+    detectedLines = cT.Output(
         doc="Lines detected in the input exposure.",
         name="detected_lines",
         storageClass="StructuredDataDict",
@@ -199,7 +197,7 @@ class DetectStreaksTaskConnections(pipeBase.PipelineTaskConnections,
     )
 
     # kht exclusive outputs
-    originalLines = connectionTypes.Output(
+    originalLines = cT.Output(
         doc="Lines identified by kernel hough transform.",
         name="original_lines",
         storageClass="StructuredDataDict",
@@ -207,13 +205,13 @@ class DetectStreaksTaskConnections(pipeBase.PipelineTaskConnections,
     )
 
     # hessian exclusive outputs
-    minimaRidges = connectionTypes.Output(
+    minimaRidges = cT.Output(
         doc="Hessian matrix minima ridges image.",
         name="minima_ridges",
         storageClass="Image",
         dimensions=("instrument", "visit", "detector"),
     )
-    binaryRidges = connectionTypes.Output(
+    binaryRidges = cT.Output(
         doc="Detected ridges image.",
         name="binary_ridges",
         storageClass="Mask",
@@ -298,7 +296,12 @@ class DetectStreaksTask(pipeBase.PipelineTask):
         )
         if self.config.detectionAlgorithm == 'kht':
             detectedLineResults = self.maskStreaks.run(exposure.getMaskedImage())
-            result.originalLines = detectedLineResults.originalLines
+            originalLines = detectedLineResults.originalLines
+            originalLinesDict = {'rhos' : originalLines.rhos.tolist(),
+                                 'thetas' : originalLines.thetas.tolist(),
+                                 'sigmas' : originalLines.sigmas.tolist(),
+                                }
+            result.originalLines = originalLinesDict
         elif self.config.detectionAlgorithm == 'hessian':
             detectedLineResults = self.streakFinder.run(exposure)
             result.minimaRidges = afwImage.ImageF(detectedLineResults.minima_ridges.astype(np.float32))
