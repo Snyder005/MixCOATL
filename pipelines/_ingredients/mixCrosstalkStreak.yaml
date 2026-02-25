@@ -5,27 +5,27 @@ tasks:
     config:
       connections.ccdExposure: "raw"
       connections.outputExposure: "cpCrosstalkIsrExp"
-      doDeferredCharge: False
       doCrosstalk: False
-      doDefect: False
-      maskListToInterpolate: ["BAD", "UNMASKEDNAN"]
-      doBrighterFatter: False
+      doDeferredCharge: False
       doDark: False
+      doDefect: False
+      doBrighterFatter: False
       doFlat: False
+      doInterpolate: False
   mixCrosstalkTask:
     class: mixcoatl.crosstalkTask.CrosstalkTask
     config:
       connections.inputExp: "cpCrosstalkIsrExp"
       connections.rawExp: "raw"
       sourceType: "streak"
-      detectStreaks.maskWidth: 80.
+      detectStreakSources.maskWidth: 80.
       crosstalkSolve.correctCovariance: True
       crosstalkSolve.backgroundOrder: 2
       crosstalkSolve.crosstalkOrder: 1
 contracts:
   - cpCrosstalkIsr.doDeferredCharge == False
   - cpCrosstalkIsr.doCrosstalk == False
-  - cpCrosstalkIsr.maskListToInterpolate == ["BAD", "UNMASKEDNAN"]
+  - cpCrosstalkIsr.doInterpolate == False
   - cpCrosstalkIsr.doBrighterFatter == False
   - mixCrosstalkTask.connections.inputExp == cpCrosstalkIsr.connections.outputExposure
   - mixCrosstalkTask.sourceType == "streak"

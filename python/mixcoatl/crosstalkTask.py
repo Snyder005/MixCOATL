@@ -166,8 +166,8 @@ class CrosstalkTask(pipeBase.PipelineTask):
     def __init__(self, **kwargs):
 
         super().__init__(**kwargs)
-        self.makeSubtask('detectStreaks')
-        self.makeSubtask('detectSpots')
+        self.makeSubtask('detectStreakSources')
+        self.makeSubtask('detectSpotSources')
         self.makeSubtask('crosstalkSolve')
 
     @timeMethod

@@ -7,4 +7,4 @@ tasks:
     class: lsst.ip.isr.IsrTaskLSST
     config:
       doCorrectGains: False
-      useGainsFrom: "PTC"
+      doLinearize: False
