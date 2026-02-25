@@ -1,0 +1,4 @@
+description: LSSTCam kht streak detection
+instrument: lsst.obs.lsst.LsstCam
+imports:
+  - location: $MIXCOATL_DIR/pipelines/_ingredients/mixDetectStreaksKHT.yaml

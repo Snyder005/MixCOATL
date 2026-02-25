@@ -1,0 +1,31 @@
+description: mixcoatl crosstalk measurement from streaks
+tasks:
+  cpCrosstalkIsr:
+    class: lsst.ip.isr.IsrTaskLSST
+    config:
+      connections.ccdExposure: "raw"
+      connections.outputExposure: "cpCrosstalkIsrExp"
+      doCrosstalk: False
+      doDeferredCharge: False
+      doDark: False
+      doDefect: False
+      doBrighterFatter: False
+      doFlat: False
+      doInterpolate: False
+  mixCrosstalkTask:
+    class: mixcoatl.crosstalkTask.CrosstalkTask
+    config:
+      connections.inputExp: "cpCrosstalkIsrExp"
+      connections.rawExp: "raw"
+      sourceType: "streak"
+      detectStreakSources.maskWidth: 80.
+      crosstalkSolve.correctCovariance: True
+      crosstalkSolve.backgroundOrder: 2
+      crosstalkSolve.crosstalkOrder: 1
+contracts:
+  - cpCrosstalkIsr.doDeferredCharge == False
+  - cpCrosstalkIsr.doCrosstalk == False
+  - cpCrosstalkIsr.doInterpolate == False
+  - cpCrosstalkIsr.doBrighterFatter == False
+  - mixCrosstalkTask.connections.inputExp == cpCrosstalkIsr.connections.outputExposure
+  - mixCrosstalkTask.sourceType == "streak"

@@ -1,0 +1,4 @@
+description: LSSTCam hessian streak detection
+instrument: lsst.obs.lsst.LsstCam
+imports:
+  - location: $MIXCOATL_DIR/pipelines/_ingredients/mixDetectStreaksHessian.yaml

@@ -1,0 +1,10 @@
+description: LSST-UCDCam crosstalk measurement from streaks
+instrument: lsst.obs.lsst.LsstUCDCam
+imports: 
+  - location: $MIXCOATL_DIR/pipelines/_ingredients/mixCrosstalkStreak.yaml
+tasks:
+  cpCrosstalkIsr:
+    class: lsst.ip.isr.IsrTaskLSST
+    config:
+      doCorrectGains: False
+      doLinearize: False

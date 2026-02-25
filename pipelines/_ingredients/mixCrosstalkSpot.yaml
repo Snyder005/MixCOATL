@@ -1,0 +1,32 @@
+description: mixcoatl crosstalk measurement from spots
+tasks:
+  cpCrosstalkIsr:
+    class: lsst.ip.isr.IsrTaskLSST
+    config:
+      connections.ccdExposure: "raw"
+      connections.outputExposure: "cpCrosstalkIsrExp"
+      doDeferredCharge: False
+      doCrosstalk: False
+      doDefect: False
+      maskListToInterpolate: ["BAD", "UNMASKEDNAN"]
+      doBrighterFatter: False
+      doDark: False
+      doFlat: False
+  mixCrosstalkTask:
+    class: mixcoatl.crosstalkTask.CrosstalkTask
+    config:
+      connections.inputExp: "cpCrosstalkProc"
+      connections.rawExp: "raw"
+      sourceType: "spot"
+      detectSpots.threshold: 5000.
+      detectSpots.maskLength: 250.
+      crosstalkSolve.correctCovariance: True
+      crosstalkSolve.backgroundOrder: 2
+      crosstalkSolve.crosstalkOrder: 1
+contracts:
+  - cpCrosstalkIsr.doDeferredCharge == False
+  - cpCrosstalkIsr.doCrosstalk == False
+  - cpCrosstalkIsr.maskListToInterpolate == ["BAD", "UNMASKEDNAN"]
+  - cpCrosstalkIsr.doBrighterFatter == False
+  - mixCrosstalkTask.connections.inputExp == cpCrosstalkIsr.connections.outputExposure
+  - mixCrosstalkTask.sourceType == "spot"
