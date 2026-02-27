@@ -1,0 +1,8 @@
+description: LSSTCam trailed glints info consolidation
+instrument: lsst.obs.lsst.LsstCam
+tasks:
+  consolidateGlints:
+    class: mixcoatl.consolidateGlints.ConsolidateGlintsTask
+    config:
+      connections.trailed_glints: "trailed_glints"
+      connections.trailed_glints_summary: "trailed_glints_summary"

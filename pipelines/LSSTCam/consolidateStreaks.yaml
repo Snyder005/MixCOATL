@@ -1,0 +1,8 @@
+description: LSSTCam streaks info consolidation
+instrument: lsst.obs.lsst.LsstCam
+tasks:
+  consolidateStreaks:
+    class: mixcoatl.consolidateStreaks.ConsolidateStreaksTask
+    config:
+      connections.streaks: "difference_streaks"
+      connections.streaks_summary: "streaks_summary"
