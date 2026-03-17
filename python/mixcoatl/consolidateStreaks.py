@@ -5,7 +5,8 @@ import lsst.pipe.base as pipeBase
 import lsst.daf.base as dafBase
 import lsst.pipe.base.connectionTypes as cT
 
-class ConsolidateStreaksConnections(pipeBase.PipelineTaskConnections, dimensions=("instrument",)):
+class ConsolidateStreaksConnections(pipeBase.PipelineTaskConnections, 
+                                    dimensions=("instrument", "visit")):
     streaks = cT.Input(
         doc="Streaks info.",
         name="streaks",
@@ -18,7 +19,7 @@ class ConsolidateStreaksConnections(pipeBase.PipelineTaskConnections, dimensions
         doc="Consolidated streaks info.",
         name="streaks_summary",
         storageClass="ArrowNumpyDict",
-        dimensions=("instrument",),
+        dimensions=("instrument", "visit"),
     )
 
 class ConsolidateStreaksConfig(pipeBase.PipelineTaskConfig,
@@ -30,23 +31,25 @@ class ConsolidateStreaksTask(pipeBase.PipelineTask):
 
     def runQuantum(self, butlerQC, inputRefs, outputRefs):
         handles = butlerQC.get(inputRefs.streaks)
+        visit = handles[0].dataId['visit']
 
-        results = self.run(handles)
+        results = self.run(visit=visit, handles=handles)
 
         butlerQC.put(results, outputRefs)
 
     def run(self, handles):
         
-        summary = {'visit' : [],
-                   'detector' : [],
-                   'rho' : [],
-                   'theta' : [],
-                   'sigma' : [],
-                   'reducedChi2' : [],
-                   'modelMaximum' : []}
+        summary = {
+            'visit' : [],
+            'detector' : [],
+            'rho' : [],
+            'theta' : [],
+            'sigma' : [],
+            'reducedChi2' : [],
+            'modelMaximum' : []
+        }
         for i, dataRef  in enumerate(handles):
             streaks = dataRef.get()
-            visit = dataRef.dataId['visit']
             detector = dataRef.dataId['detector']
             num_streaks = len(streaks['rho'])
             for j in range(num_streaks):

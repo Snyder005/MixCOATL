@@ -5,7 +5,8 @@ import lsst.pipe.base as pipeBase
 import lsst.daf.base as dafBase
 import lsst.pipe.base.connectionTypes as cT
 
-class ConsolidateGlintsConnections(pipeBase.PipelineTaskConnections, dimensions=("instrument",)):
+class ConsolidateGlintsConnections(pipeBase.PipelineTaskConnections, 
+                                   dimensions=("instrument", "visit")):
     trailed_glints = cT.Input(
         doc="Trailed glints info.",
         name="trailed_glints",
@@ -18,7 +19,7 @@ class ConsolidateGlintsConnections(pipeBase.PipelineTaskConnections, dimensions=
         doc="Consolidated trailed glints info.",
         name="trailed_glints_summary",
         storageClass="ArrowNumpyDict",
-        dimensions=("instrument",),
+        dimensions=("instrument", "visit"),
     )
 
 class ConsolidateGlintsConfig(pipeBase.PipelineTaskConfig,
@@ -30,23 +31,42 @@ class ConsolidateGlintsTask(pipeBase.PipelineTask):
 
     def runQuantum(self, butlerQC, inputRefs, outputRefs):
         handles = butlerQC.get(inputRefs.trailed_glints)
+        visit = handles[0].dataId["visit"]
 
-        results = self.run(handles)
+        results = self.run(visit=visit, handles=handles)
 
         butlerQC.put(results, outputRefs)
 
-    def run(self, handles):
-        
-        summary = {'visit' : [],
-                   'detector' : [],
-                   'slopes' : [],
-                   'intercepts' : [],
-                   'stderrs' : [],
-                   'lengths' : [],
-                   'angles' : []}
+    def run(self, *, visit, handles):
+        """Make a trailed glints summary from a list of handles.
+        These handles must point to trailed glint information dictionaries.
+
+        Parameters
+        ----------
+        visit : `int`
+            Visit identification number.
+        handles: `list` of `lsst.daf.butler.DeferredDatasetHandles`
+            List of handles in visit.
+
+        Returns
+        -------
+        result : `lsst.pipe.base.Struct`
+            Struct with the following attributes:
+
+            - ``trailed_glints_summary`` (`dict`): A per-visit dictionary with
+              trailed glints information.
+        """ 
+        summary = {
+            'visit' : [],
+            'detector' : [],
+            'slopes' : [],
+            'intercepts' : [],
+            'stderrs' : [],
+            'lengths' : [],
+            'angles' : []
+        }
         for i, dataRef  in enumerate(handles):
             trailed_glints = dataRef.get()
-            visit = dataRef.dataId['visit']
             detector = dataRef.dataId['detector']
             num_glints = len(trailed_glints['slopes'])
             for j in range(num_glints):
