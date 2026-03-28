@@ -3,23 +3,34 @@ instrument: lsst.obs.lsst.LsstCam
 imports:
   - location: $DRP_PIPE_DIR/pipelines/LSSTCam/DRP-compat.yaml
 tasks:
-  detectAndMeasureDiaSources:
+  detectAndMeasureDiaSource:
     class: lsst.ip.diffim.detectAndMeasure.DetectAndMeasureTask
     config:
-      writeStreakInfo: True
+      connections.science: visit_image
+      connections.matchedTemplate: template_matched
+      connections.difference: difference_image_predetection
+      connections.kernelSources: difference_kernel_sources
+      connections.outputSchema: dia_source_schema
+      connections.diaSources: dia_source_unfiltered
+      connections.subtractedMeasuredExposure: difference_image
+      connections.maskedStreaks: difference_streaks
+      connections.glintTrailInfo: trailed_glints
+      doSkySources: true
+      writeStreakInfo: true
+      idGenerator.release_id: parameters.release_id
   consolidateGlints:
     class: mixcoatl.consolidateGlints.ConsolidateGlintsTask
     config:
-      connections.trailed_glints: "trailed_glints"
-      connections.trailed_glints_visit: "trailed_glints_visit"
+      connections.trailed_glints: trailed_glints
+      connections.trailed_glints_visit: trailed_glints_visit
   consolidateStreaks:
     class: mixcoatl.consolidateStreaks.ConsolidateStreaksTask
     config:
-      connections.streaks: "difference_streaks"
-      connections.streaks_summary: "streaks_summary"
+      connections.streaks: difference_streaks
+      connections.streaks_visit: difference_streaks_visit
 subsets:
   satellite-analysis:
     subset:
-      - detectAndMeasureDiaSources
+      - detectAndMeasureDiaSource
       - consolidateGlints
-      - consolidateStreaks  
+      - consolidateStreaks
