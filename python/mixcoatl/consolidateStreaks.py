@@ -47,13 +47,6 @@ class ConsolidateStreaksTask(pipeBase.PipelineTask):
         results = self.run(visit=visit, handles=handles)
         butlerQC.put(results, outputRefs)
 
-        handles = butlerQC.get(inputRefs.streaks)
-        visit = handles[0].dataId['visit']
-
-        results = self.run(visit=visit, handles=handles)
-
-        butlerQC.put(results, outputRefs)
-
     def run(self, *, visit, handles):
         # Define table metadata
         visit_metadata = {'visit' : visit}
