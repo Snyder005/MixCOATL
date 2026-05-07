@@ -1,23 +1,18 @@
 import math
 import numpy as np
 
-import lsst.geom as geom
-from lsst.afw.cameraGeom import FOCAL_PLANE, PIXELS
-
 
 def fit_line(x_array, y_array):
     """Fit a line in Hesse normal form."""
-    xc = np.mean(x_array)
-    yc = np.mean(y_array)
+    pts = np.column_stack([x_array, y_array])
+    centroid = pt_array.mean(axis=0)
+    X = pts - centroid
 
-    X = np.vstack([x_array - xc, y_array - yc]).T
-    u, s, vh = np.linalg.svd(X)
-    n = geom.Extent2D(vh[-1])
-    n /= n.computeNorm()
-
-    rho = xc * n.getX() + yc * n.getY()
-    theta = np.arctan2(n.getY(), n.getX())
-
+    _, _, Vh = np.linalg.svd(X)
+    n = Vh[-1]
+    
+    rho = np.dot(centroid, n)
+    theta = np.arctan2(n[1], n[0])
     return rho, theta
 
 def regularize_line(rho, theta):
