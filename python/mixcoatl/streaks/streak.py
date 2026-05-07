@@ -4,7 +4,7 @@ import lsst.geom as geom
 import numpy as np
 from lsst.afw.cameraGeom import FOCAL_PLANE, PIXELS
 
-from .line import set_canonical_hesse
+from .utils import regularize_line
 
 
 class Streak:
@@ -21,7 +21,7 @@ class Streak:
             To transform from PIXELS to FOCAL_PLANE
     """
     def __init__(self, rho: float, theta: float, visit: int, detector):
-        self.rho, self.theta = set_canonical_hesse(rho, theta)
+        self.rho, self.theta = regularize_line(rho, theta)
         self.visit = visit
         self.detector = detector
 
@@ -89,4 +89,4 @@ class Streak:
         theta_fp = np.arctan2(n_fp.getY(), n_fp.getX())
         rho_fp = np.dot(n_fp, p0_fp)
 
-        return canonical_hesse(rho_fp, theta_fp)
+        return regularize_line(rho_fp, theta_fp)
