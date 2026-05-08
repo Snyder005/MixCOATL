@@ -34,6 +34,14 @@ def line_to_focal_plane(rho, theta, detector):
 
 
 class ClusterStreaksConnections(PipelineTaskConnections, dimensions=("instrument", "visit")):
+    camera = Input(
+        doc="Input camera for geometry information.",
+        name="camera",
+        storageClass="Camera",
+        dimensions=["instrument"],
+        isCalibration=True,
+    )
+    
     preliminary_streaks_visit = Input(
         doc="Input preliminary per-visit streaks info.",
         name="preliminary_streaks_visit",
@@ -91,22 +99,27 @@ class ClusterStreaksTask(PipelineTask):
                 (`astropy.Table`).
         """ 
         points3d = []
-        for row in preliminary_streaks_visit:
-            detector_id = int(row["detector"])
-            detector = camera[detector_id]
-            rho_fp, theta_fp = line_to_focal_plane(row["rho"], row["theta"], detector)
 
-            rho_tol = self.config.rho_tol
-            theta_tol = math.radians(self.config.theta_tol)
-            points3d.append(embed_line(rho_fp, theta_fp, rho_tol, theta_tol))
-        
-        clustering = AgglomerativeClustering(
-            n_clusters=None,
-            linkage="average",
-            distance_threshold=self.config.threshold,
-        )
+        if len(preliminary_streaks_visit) > 0:
+            for row in preliminary_streaks_visit:
+                detector_id = int(row["detector"])
+                detector = camera[detector_id]
+                rho_fp, theta_fp = line_to_focal_plane(row["rho"], row["theta"], detector)
 
-        labels = clustering.fit_predict(np.array(points3d))
+                rho_tol = self.config.rho_tol
+                theta_tol = math.radians(self.config.theta_tol)
+                points3d.append(embed_line(rho_fp, theta_fp, rho_tol, theta_tol))
+            
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                linkage="average",
+                distance_threshold=self.config.threshold,
+            )
+
+            labels = clustering.fit_predict(np.array(points3d))
+        else:
+            labels = []
+            
         label_col = Column(name="cluster_label", data=labels, dtype="int32")
         preliminary_streaks_visit.add_column(label_col)
         

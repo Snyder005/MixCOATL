@@ -30,6 +30,7 @@ tasks:
       connections.streaks_visit: difference_streaks_visit
   clusterStreaks:
     class: mixcoatl.streaks.ClusterStreaksTask
+    config:
       connections.preliminary_streaks_visit: difference_streaks_visit
       connections.streaks_visit: final_streaks_visit
 subsets:
