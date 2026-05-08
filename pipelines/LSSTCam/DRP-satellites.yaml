@@ -28,9 +28,14 @@ tasks:
     config:
       connections.streaks: difference_streaks
       connections.streaks_visit: difference_streaks_visit
+  clusterStreaks:
+    class: mixcoatl.streaks.ClusterStreaksTask
+      connections.preliminary_streaks_visit: difference_streaks_visit
+      connections.streaks_visit: final_streaks_visit
 subsets:
   satellite-analysis:
     subset:
       - detectAndMeasureDiaSource
       - consolidateGlints
       - consolidateStreaks
+      - clusterStreaks
