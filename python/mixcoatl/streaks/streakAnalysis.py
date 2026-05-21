@@ -21,13 +21,13 @@ class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument
     )
 
     # hessian exclusive outputs
-    minima_ridges = cT.Output(
+    minima_ridges = Output(
         doc="Hessian matrix minima ridges image.",
         name="minima_ridges",
         storageClass="Image",
         dimensions=("instrument", "visit", "detector"),
     )
-    binary_ridges = cT.Output(
+    binary_ridges = Output(
         doc="Detected ridges image.",
         name="binary_ridges",
         storageClass="Mask",
@@ -69,18 +69,18 @@ class StreakAnalysisTask(PipelineTask):
 
         if self.config.detection_algorithm == "hessian":
             detect_streak_result = self.detect_streaks.run(exposure)
+            lines = detect_streak_result.lines
             result.minima_ridges = ImageF(detect_streak_result.minima_ridges.astype(np.float32))
             result.binary_ridges = MaskX(detcted_streak_result.binary_ridges.astype(np.int32))
-            lines = detect_streak_result.lines
 
-        num_lines = len(lines)
+        catalog = makeStreakCatalog()
+        detector_id = exposure.getDetector().getId()
+        for line in lines:
+            rec = catalog.addNew()
+            rec["detector"] = detector_id
+            rec["line_rho"] = line.rho
+            rec["line_theta"] = line.theta
 
-        table = Table()
-        table.add_columns([
-            Column(name="detector_id", data=np.full(num_lines, detector_id), dtype=np.int32),
-            Column(name="rho", data=[l.rho for l in lines], dtype=np.float64),
-            Column(name="theta", data=[l.theta.asDegrees() for l in lines], dtype=np.float64),
-        ])
-        result.detected_lines=table
+        result.detected_lines = catalog
 
         return result

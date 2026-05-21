@@ -3,10 +3,9 @@ import numpy as np
 from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 
 from lsst.geom import Point2I
-from lsst.meas.algorithms.maskStreaks import LineCollection
 from lsst.pex.config import Config, Field
-from lsst.pipe.base import Task
-
+from lsst.pipe.base import Struct, Task
+from mixcoatl.streaks.line import fit_line_from_xy
 
 class HessianDetectConfig(Config):
     """Configurable parameters for StreakFinderTask.
@@ -31,7 +30,6 @@ class HessianDetectConfig(Config):
         dtype=int,
         default=20,
     )
-
     threshold = Field(
         doc="Threshold applied to the Hessian minima ridges eigenvalue array.",
         dtype=float,
@@ -109,7 +107,7 @@ class HessianDetectTask(Task):
             points = np.column_stack((xs, ys))
             rect = cv2.minAreaRect(points)
             (center, (width, height), angle) = rect
-            if height > 0:
+            if height > 0 and width > 0:
                 aspect_ratio = max(width, height) / min(width, height)
             else:
                 aspect_ratio = 0  # Handle division by zero for flat regions
@@ -124,19 +122,12 @@ class HessianDetectTask(Task):
             mask = np.uint8(labels == label)
             # Extract points (x,y) of this component
             ys, xs = np.where(mask > 0)
-            points = np.column_stack((xs, ys))
-            
-            # Fit a line through the points
-            # x0, y0 are shape centroid
-            # vx, vy are a normlized vector in the direction of the line
-            # Resize x0 and y0 to the original image
-            [vx, vy, x0, y0] = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
-            direction = Extent2D(vx, vy)
-            point = Point2D(x0 * binsize, y0 * binsize)
 
-            lines.append(Line2D.from_point_and_direction(point, direction))
+            line = fit_line_from_xy(xs, ys)
+            line.rescale(float(bin_size))
+            lines.append(line)
 
-        return pipeBase.Struct(
+        return Struct(
             lines=lines,
             minima_ridges=minima_ridges,
             binary_ridges=binary_ridges,
