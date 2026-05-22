@@ -9,9 +9,10 @@ from lsst.pex.config import Field
 from lsst.pipe.base import PipelineTask, PipelineTaskConfig, PipelineTaskConnections, Struct
 from lsst.pipe.base.connectionTypes import Input, Output
 
-from .utils import regularize_line, embed_line
+from .line import embed_rho_theta
 
 __all__ = ["ClusterStreaksTask", "ClusterStreaksConfig"]
+
 
 def line_to_focal_plane(rho, theta, detector):
     """Convert an LSST `Line` parameters to focal plane coordinate system."""
@@ -30,7 +31,7 @@ def line_to_focal_plane(rho, theta, detector):
     rho_fp = normal_fp.getX() * point0_fp.getX() + normal_fp.getY() * point0_fp.getY()
     theta_fp = math.atan2(normal_fp.getY(), normal_fp.getX())
 
-    return regularize_line(rho_fp, theta_fp)
+    return rho_fp, theta_fp
 
 
 class ClusterStreaksConnections(PipelineTaskConnections, dimensions=("instrument", "visit")):
@@ -97,33 +98,22 @@ class ClusterStreaksTask(PipelineTask):
             ``streaks_visit``
                 A table of per-visit streaks including clustering labels
                 (`astropy.Table`).
-        """ 
-        points3d = []
-
+        """
         if len(preliminary_streaks_visit) > 0:
-            for row in preliminary_streaks_visit:
-                detector_id = int(row["detector"])
-                detector = camera[detector_id]
-                rho_fp, theta_fp = line_to_focal_plane(row["rho"], row["theta"], detector)
-
-                rho_tol = self.config.rho_tol
-                theta_tol = math.radians(self.config.theta_tol)
-                points3d.append(embed_line(rho_fp, theta_fp, rho_tol, theta_tol))
+#            for row in preliminary_streaks_visit:
+#                detector_id = int(row["detector"])
+#                detector = camera[detector_id]
+#                rho_fp, theta_fp = line_to_focal_plane(row["rho"], row["theta"], detector)
+            rho_tol = self.config.rho_tol
+            theta_tol = math.radians(self.config.theta_tol)
+            embedded_points = embed_rho_theta(rho_fp, theta_fp, rho_tol, theta_tol)
             
-            clustering = AgglomerativeClustering(
-                n_clusters=None,
-                linkage="average",
-                distance_threshold=self.config.threshold,
-            )
-
-            labels = clustering.fit_predict(np.array(points3d))
+            clustering = DBSCAN(eps=self.config.threshold, min_samples=1, metric="euclidean")
+            labels = clustering.fit_predict(embedded_points)
         else:
             labels = []
             
         label_col = Column(name="cluster_label", data=labels, dtype="int32")
         preliminary_streaks_visit.add_column(label_col)
-        
-        # Patch fix to try to set detector column to int
-        preliminary_streaks_visit["detector"] = preliminary_streaks_visit["detector"].astype("int32")
 
         return Struct(streaks_visit=preliminary_streaks_visit)
