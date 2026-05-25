@@ -14,6 +14,8 @@ import lsst.geom as geom
 class LineGeometry2D(ABC):
     """Abstract base class for transformable line geometries."""
 
+    _TRANSFORM_BASELINE: float = 10.0
+
     @classmethod
     @abstractmethod
     def from_points(cls, p0: geom.Point2D, p1: geom.Point2D) -> Self:
@@ -24,18 +26,52 @@ class LineGeometry2D(ABC):
     def at(self, s: float) -> geom.Point2D:
         """Evaluate geometry at parameter s."""
         ...
+    
+    @abstractmethod
+    def contains(self, point: geom.Point2D, atol: float = 1e-12) -> bool:
+        """Return ``True`` if point lies on line geometry."""
+    ...
 
-    def clipped_to(self, box: geom.Box2D | geom.Box2I) -> Self | None:
+    @abstractmethod
+    def intersections_with_box_edges(
+        self,
+        box: geom.Box2I | geom.Box2D,
+        atol: float = 1e-12,
+    ) -> list[geom.Point2D]
+        """Return intersection points with a box boundary."""
+        ...
+
+    @abstractmethod
+    def _defining_points(self) -> tuple[geom.Point2D, geom.Point2D]:
+        """Return the two points defining the line geometry."""
+        ...
+
+    @abstractmethod
+    def _interval_in_box(self, box: geom.Box2I | geom.Box2D) -> geom.IntervalD | None:
+        """Return valid parameter interval in box."""
+        ...
+
+    def clipped_to(self, box: geom.Box2D | geom.Box2I) -> LineSegment2D | None:
         """Clip line geometry to a box."""
         interval = self._interval_in_box(box)
 
         if interval is None:
             return None
 
-        p0 = self._evaluate(interval.min)
-        p1 = self._evalue(interval.max)
+        p0 = self.at(interval.min)
+        p1 = self.at(interval.max)
 
-        return type(self).from_points(p0, p1)
+        return LineSegment2D.from_points(p0, p1)
+
+    def intersection(self, box: geom.Box2D | geom.Box2I) -> LineSegment2D | None:
+        """Return intersection with a box.
+
+        Parameters
+        ----------
+        box : `lsst.geom.Box2I` or `lsst.geom.Box2D`
+            The box to intersect the line geometry with.
+        """
+        return self.clipped_to(box)
 
     def transformed(self, transform: Any, baseline: float = 10.0) -> Self:
         """Apply a geometric transformation.
@@ -59,8 +95,8 @@ class LineGeometry2D(ABC):
         """
         p0, p1 = self.defining_points()
 
-        p0_t = _LineGeometry2D._apply_transform(transform, p0)
-        p1_t = _LineGeometry2D._apply_transform(transform, p1)
+        p0_t = _apply_transform(transform, p0)
+        p1_t = _apply_transform(transform, p1)
 
         return type(self).from_points(p0_t, p1_t)
 
@@ -109,59 +145,12 @@ class LineGeometry2D(ABC):
         """
         return self.transformed(geom.AffineTransform.makeTranslation(translation))
 
-    @abstractmethod
-    def _defining_points(self) -> tuple[geom.Point2D, geom.Point2D]:
-        """Return two points defining the line geometry."""
-        ...
-
-    @abstractmethod
-    def _interval_in_box(self, box: geom.Box2I | geom.Box2D) -> geom.IntervalD | None:
-        """Return valid parameter interval in box."""
-        ...
-
-    @abstractmethod
-    def _evaluate(self, s: float) -> geom.Point2D:
-        """Evaluate point along line geometry."""
-        ...
-
-    @staticmethod
-    def _apply_transform(transform: Any, point: geom.Point2D) -> geom.Point2D:
-        """Apply a transform to a point.
-
-        Apply a transformation to a point either by calling the applyForward 
-        method of the object or calling the object directly.
-
-        Parameters
-        ----------
-        transform:
-            The object the encapsulates the transformation.
-        point: `lsst.geom.Point2D`
-            The point to transform.
-
-        Returns
-        -------
-        transformed : `lsst.geom.Point2D`
-            The transformed point.
-
-        Raises
-        ------
-        TypeError
-            Raised if ``transform`` does not have a valid callable interface.
-        """
-        if hasattr(transform, "applyForward"):
-            return transform.applyForward(point)
-
-        if callable(transform):
-            return transform(point)
-
-        raise TypeError("transform is invalid callable or object")
 
 
-
-class Line2D:
+class Line2D(LineGeometry2D):
 
     def __init__(self, rho: float, theta: geom.Angle):
-        rho, theta = Line2D._canonicalize(rho, theta)
+        rho, theta = _canonicalize(rho, theta)
         self._rho = rho
         self._theta = theta
 
@@ -210,7 +199,7 @@ class Line2D:
         direction = direction / norm
         normal = geom.Extent2D(-direction.y, direction.x)
 
-        rho = Line2D._dot(geom.Extent2D(point), normal)
+        rho = _dot(geom.Extent2D(point), normal)
         theta = math.atan2(normal.y, normal.x) * geom.radians
 
         return cls(rho, theta)
@@ -242,6 +231,51 @@ class Line2D:
         """The point on the line closest to the origin."""
         return geom.Point2D(self.normal * self.rho)
 
+    def at(self, s: float) -> geom.Point2D:
+        return self.origin + self.direction * s
+
+    def contains(self, point: geom.Point2D, atol: float = 1e-12) -> bool:
+        """Return ``True`` if point lies on the line."""
+        return abs(self.distance(point)) <= atol
+
+    def intersections_with_box_edges(
+        self,
+        box: geom.Box2I | geom.Box2D,
+        atol: float = 1e-12,
+    ) ->list[geom.Point2D]:
+        """Return intersection points with box boundary."""
+        o = self.origin
+        d = self.direction
+
+        xmin = box.minX
+        xmax = box.maxX
+        ymin = box.minY
+        ymax = box.maxY
+
+        points: list[geom.Point2D] = []
+        if abs(d.x) > atol:
+            for x in (xmin, xmax):
+                p = self.at((x - o.x) / d.x)
+                if ymin - atol <= p.y <= ymax + atol:
+                    points.append(p)
+
+        if abs(d.y) > atol:
+            for y in (ymin, ymax):
+                p = self.at((y - o.y) / d.y)
+                if xmin - atol <= p.x <= xmax + atol:
+                    points.append(p)
+
+        unique: list[geom.Point2D] = []
+        for p in points:
+            for q in unique:
+                if p.distanceSquared(q) <= atol * atol:
+                    break
+
+        else:
+            unique.append(p)
+
+        return unique
+
     def project(self, point: geom.Point2D) -> float:
         """Project a point onto the line coordinate system.
 
@@ -257,138 +291,60 @@ class Line2D:
             to the point closest to the origin.
         """
         delta = point - self.origin
-        return Line2D._dot(delta, self.direction)
+        return _dot(delta, self.direction)
 
-    def distance(self, point: geom.Point2D) -> float:
+    def signed_distance(self, point: geom.Point2D) -> float:
         """Compute the signed perpendicular distance to the line."""
         delta = point - self.origin
-        return Line2D._dot(delta, self.normal)
-
-    def get_box_intercepts(self, box: geom.Box2I) -> tuple[geom.Point2D, geom.Point2D]:
-        """Calculate the intersection points between the line and a box.
-
-        Parameters
-        ----------
-        box : `lsst.geom.Box2I`
-            The bounding box to intersect with the line.
-
-        Returns
-        -------
-        p1 : `lsst.geom.Point2D`
-            First intersection point between the line and the box bounds.
-        p2 : `lsst.geom.Point2D`
-            Second intersection point between the line and the box bounds.
-
-        Returns
-        -------
-        ValueError
-            Raised if the line does not intersect the box in exactly two
-            points.
-        """
-        xmin = box.minX
-        xmax = box.maxX
-        ymin = box.minY
-        ymax = box.maxY
-
-        p0 = self.point
-        d = self.direction
-
-        points = []
-        if abs(d.x) > 1e-14:
-            for x in (xmin, xmax):
-                y = p0.y + (x - p0.x) * d.y / d.x
-                if ymin - 1e-12 <= y <= ymax + 1e-12:
-                    points.append(geom.Point2D(x, y))
-
-        if abs(d.y) > 1e-14:
-            for y in (ymin, ymax):
-                x = p0.x + (y - p0.y) * d.x / d.y
-                if xmin - 1e-12 <= x <= xmax + 1e-12:
-                    points.append(geom.Point2D(x, y))
-
-        unique = []
-        for p in points:
-            if all(p.distanceSquared(q) >= 2e-18 for q in unique):
-                unique.append(p)
-
-        if len(unique) < 2:
-            raise ValueError("line does not intersect box in exactly two points")
-
-        return unique[0], unique[1]
+        return _dot(delta, self.normal)
 
     def _defining_points(self) -> tuple[geom.Point2D, geom.Point2D]:
         """Return two points defining the line."""
-        p0 = self.origin
-        p1 = self.at(self._TRANSFORM_BASELINE)
+        return self.origin, self.at(self._TRANSFORM_BASELINE)
 
-        return p0, p1
-
-    def _evaluate(self, s: float) -> geom.Point2D:
-        return self.origin + self.direction * s
-
-    def _line_coordinate_interval_in_box(self, box: geom.Box2D | geom.Box2I):
+    def _interval_in_box(self, box: geom.Box2I | geom.Box2D) -> geom.IntervalD | None:
         return _line_box_interval(self, box)
 
-    @staticmethod
-    def _canonicalize(rho: float, theta: geom.Angle) -> tuple[float, geom.Angle]:
-        """Convert line parameters to a canonical Hesse normal form.
 
-        Parameters
-        ----------
-        rho : `float`
-            Signed perpendicular distance from the origin to the line.
-        theta : `float`
-            Angle of the line normal vector.
-
-        Returns
-        -------
-        rho : `float`
-            Canonical signed perpendicular distance.
-        theta : `lsst.geom.Angle`
-            Canonical normal angle in the interval [0, pi).
-        """
-        theta_rad = theta.asRadians() % (2 * math.pi)
-
-        if theta_rad >= math.pi:
-            theta_rad -= math.pi
-            rho = -rho
-        
-        return rho, theta_rad * geom.radians
-
-    @staticmethod
-    def _dot(v1: geom.Extent2D, v2: geom.Extent2D) -> float:
-        """Compute the Euclidean dot product of two vectors."""
-        return v1.x * v2.x + v1.y * v2.y
-
-
-@dataclass(frozen=True)
-class LineSegment2D:
+class LineSegment2D(LineGeometry2D):
     """A line segment geometric primitive."""
-    line: Line2D
-    interval: geom.IntervalD
 
-    def from_points(cls, p0: geom.Point2D, p1: geom.Point2D) -> Self:
-        line = Line2D.from_points(p0, p1)
-        interval = geom.IntervalD.fromSpannedPoints(line.project(p0), line.project(p1))
+    def __init__(self, line: Line2D, interval: geom.IntervalD):
+        self._line = line
+        self._interval = interval
 
-        return cls(line, interval)
-
+    @classmethod    
     def from_center_length(cls, line: Line2D, center: float, length: float) -> Self:
         h = 0.5 * length
         interval = geom.IntervalD.fromSpannedPoints((center - h, center + h))
         return cls(line, interval)
 
+    @classmethod
+    def from_points(cls, p0: geom.Point2D, p1: geom.Point2D) -> Self:
+        line = Line2D.from_points(p0, p1)
+        interval = geom.IntervalD.fromSpannedPoints([line.project(p0), line.project(p1)])
+
+        return cls(line, interval)
+
+    @property
+    def line(self) -> Line2D:
+        return self._line
+
+    @property
+    def interval(self) -> geom.IntervalD:
+        return self._interval
+
     @property
     def p0(self) -> geom.Point2D:
-        return self.line.at(self.interval.min)
+        return self.at(self.interval.min)
 
     @property
     def p1(self) -> geom.Point2D:
-        return self.line.at(self.interval.max)
+        return self.at(self.interval.max)
 
     @property
     def center(self) -> geom.Point2D:
-        return self.line.at(self.interval.center)
+        return self.at(self.interval.center)
 
     @property
     def length(self) -> float:
@@ -398,14 +354,32 @@ class LineSegment2D:
     def half_length(self) -> float:
         return 0.5 * self.length
 
+    def at(self, s: float) -> geom.Point2D:
+        return self.line.at(s)
+
+    def contains(self, point: geom.Point2D, atol: float = 1e-12) -> bool:
+        """Return ``True`` if point lies on segment."""
+        if not self.line.contains(point, atol=atol):
+            return False
+
+        s = self.line.project(point)
+        return (self.interval.min - atol) <= s <= (self.interval.max + atol)
+
+    def intersections_with_box_edges(
+        self,
+        box: geom.Box2I | geom.Box2D,
+        atol: float = 1e-12,
+    ) -> list[geom.Point2D]
+
+        return [
+            p for p in self.line.intersections_with_box_edges(box, atol=atol) if self.contains(p, atol=atol)
+        ]
+
     def _defining_points(self) -> tuple[geom.Point2D, geom.point2D]:
         """Return segment endpoints."""
         return self.p0, self.p1
 
-    def _evaluate(self, s: float) -> Point2D:
-        return self.line._evaluate(s)
-
-    def _line_coordinate_interval_in_box(self, box: geom.Box2I | box: geom.Box2D):
+    def _interval_in_box(self, box: geom.Box2I | geom.Box2D) -> geom.IntervalD | None:
         box_interval = _line_box_interval(self.line, box)
 
         if box_interval is None:
@@ -418,6 +392,7 @@ class LineSegment2D:
             return None
 
         return geom.IntervalD.fromSpannedPoints([smin, smax])
+
 
 def embed_rho_theta(
         rho: ArrayLike,
@@ -509,6 +484,38 @@ def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = Non
     return LineSegment2D(line=line, interval=interval) 
 
 
+def _apply_transform(transform: Any, point: geom.Point2D) -> geom.Point2D:
+    """Apply a transform to a point.
+
+    Apply a transformation to a point either by calling the applyForward 
+    method of the object or calling the object directly.
+
+    Parameters
+    ----------
+    transform:
+        The object the encapsulates the transformation.
+    point: `lsst.geom.Point2D`
+        The point to transform.
+
+    Returns
+    -------
+    transformed : `lsst.geom.Point2D`
+        The transformed point.
+
+    Raises
+    ------
+    TypeError
+        Raised if ``transform`` does not have a valid callable interface.
+    """
+    if hasattr(transform, "applyForward"):
+        return transform.applyForward(point)
+
+    if callable(transform):
+        return transform(point)
+
+    raise TypeError("transform is invalid callable or object")
+
+
 def _calculate_fit_info(centered: NDarray, weights: NDarray, normal: NDarray):
 
     wsum = np.sum(weights)
@@ -529,3 +536,90 @@ def _calculate_fit_info(centered: NDarray, weights: NDarray, normal: NDarray):
     covariance = np.array([[var_rho, 0.0], [0.0, var_theta]])
 
     return covariance, rms, chi2, half_length
+
+
+def _canonicalize(rho: float, theta: geom.Angle) -> tuple[float, geom.Angle]:
+    """Convert line parameters to a canonical Hesse normal form.
+
+    Parameters
+    ----------
+    rho : `float`
+        Signed perpendicular distance from the origin to the line.
+    theta : `float`
+        Angle of the line normal vector.
+
+    Returns
+    -------
+    canonical_rho : `float`
+        Canonical signed perpendicular distance.
+    canonical_theta : `lsst.geom.Angle`
+        Canonical normal angle in the interval [0, pi).
+    """
+    theta_rad = theta.asRadians() % (2 * math.pi)
+
+    if theta_rad >= math.pi:
+        theta_rad -= math.pi
+        rho = -rho
+    
+    return rho, theta_rad * geom.radians
+
+
+def _dot(v0: geom.Extent2D, v1: geom.Extent2D) -> float:
+    """Compute the Euclidean dot product of two vectors.
+    
+    Parameters
+    ----------
+    v0 : `lsst.geom.Extent2D`
+        The first vector.
+    v1 : `lsst.geom.Extent2D`
+        The second vector.
+        
+    Returns
+    -------
+    dot_product : `float`
+        The dot product of the two vectors.
+    """
+    return v1.x * v2.x + v1.y * v2.y
+
+
+def _line_box_interval(line: Line2D, box: geom.Box2D | geom.Box2I) -> geom.IntervalD | None:
+    """Compute the line parameter interval inside a box.
+
+    Uses slab intersection in parametric form.
+    """
+    origin = line.origin
+    direction = line.direction
+
+    xmin = box.minX
+    xmax = box.maxX
+    ymin = box.minY
+    ymax = box.maxY
+
+    smin = -math.inf
+    smax = math.inf
+
+    def clip_axis(p0: float, dp: float, lo: float, hi: float) -> tuple[float, float] | None:
+        if abs(dp) < 1e-15:
+            if p0 < lo or p0 > hi:
+                return None
+
+            return -math.inf, math.inf
+
+        s0 = (lo - p0) / dp
+        s1 = (hi - p0) / dp
+
+        return min(s0, s1), max(s0, s1)
+
+    if (x_interval := clip_axis(origin.x, direction.x, xmin, xmax)) is None:
+        return None
+
+    if (y_interval := clip_axis(origin.y, direction.y, ymin, ymax)) is None:
+        return None
+
+    smin = max(smin, x_interval[0], y_interval[0])
+    smax = min(smax, x_interval[1], y_interval[1])
+
+    if smin > smax:
+        return None
+
+    return geom.IntervalD.fromSpannedPoints([smin, smax])
