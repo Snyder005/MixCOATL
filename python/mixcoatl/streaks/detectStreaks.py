@@ -1,11 +1,24 @@
-import cv2
+# Can return Line2D plus a line segment representation (center/half-length), plus line fit statistics.
 import numpy as np
 from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 
-from lsst.geom import Point2I
+import lsst.afw.math as afwMath
+import lsst.geom as geom
 from lsst.pex.config import Config, Field
 from lsst.pipe.base import Struct, Task
 from mixcoatl.streaks.line import fit_line_from_xy
+
+
+class KHTDetectConfig(Config):
+    ...
+
+class KHTDetectTask(Task):
+    ConfigClass = KHTDetectConfig
+    _DefaultName = "khtDetect"
+
+    def run(self):
+        ...
+
 
 class HessianDetectConfig(Config):
     """Configurable parameters for StreakFinderTask.
@@ -15,35 +28,30 @@ class HessianDetectConfig(Config):
         dtype=int,
         default=4
     )
-    kernel = Field(
-        doc="Size of Gaussian kernel for initial smoothing.",
-        dtype=int,
-        default=11,
-    )
     sigma = Field(
-        doc="Standard deviation of the Gaussian kernel used to compute the Hessian second derivatives.",
+        doc="Size of the Gaussian kernel sigma used to compute the Hessian second derivatives.",
         dtype=float,
         default=12.0,
     )
-    edge = Field(
-        doc="Number of edge pixels to zero out in the binned image before thresholding.",
+    threshold_nsig = Field(
+        doc="Threshold number of sigma applied to the Hessian minima ridges eigenvalue array.",
+        dtype=float,
+        default=5.0,
+    )
+    eccentricity = Field(
+        doc="Lower bound for the eccentricity of the the minima regions.",
+        dtype=float,
+        default=0.98,
+    )
+    min_area = Field(
+        doc="Mininum pixel area of minima regions.",
         dtype=int,
-        default=20,
+        default=5,
     )
-    threshold = Field(
-        doc="Threshold applied to the Hessian minima ridges eigenvalue array.",
-        dtype=float,
-        default=-0.05,
-    )
-    aspect = Field(
-        doc="Lower bound for the aspect ratio of regions, after thresholding",
-        dtype=float,
-        default=8.0,
-    )
-    limit = Field(
-        doc="Limit of the deviation from horizontal/vertical orientation for streak exclusion",
-        dtype=float,
-        default=0.10,
+    bad_mask_planes = ListField(
+        doc="Names of mask plane regions to ignore when doing streak detection.",
+        dtype=str,
+        default=("NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"),
     )
 
 
@@ -53,79 +61,59 @@ class HessianDetectTask(Task):
 
     def run(self, exposure):
 
-        arr = exposure.getImage().getArray()
-
-        # Bin original image down to binxbin pixels
+        # Bin exposure image and mask
         bin_size = self.config.bin_size
-        arr = np.clip(arr, a_min=0, a_max=100)
-        new_shape = (int(arr.shape[0] / bin_size), int(arr.shape[1] / bin_size))
-        
-        # Rebin by averaging
-        bin_arr = arr.reshape(
-            new_shape[0],
-            arr.shape[0] // new_shape[0],
-            new_shape[1],
-            arr.shape[1] // new_shape[1]
-        ).mean(-1).mean(1)
-    
-        # Use the Hessian matrix to find streaks
-        # The minima ridges output has been most effective
-        # in finding the streaks
-        kernel = self.config.kernel
-        gauss = cv2.GaussianBlur(bin_arr, (kernel, kernel), 0) # Blur with Gaussian kernel
+        masked_image = exposure.getMaskedImage()
+        binned_image = afwMath.binImage(masked_image, bin_size)
+        binned_array = binned.image.array.astype(np.float32, copy=False)        
+        binned_mask = binned.mask.array
 
-        sigma = self.config.sigma
-        h_elems = hessian_matrix(gauss, sigma=sigma, order='rc', use_gaussian_derivatives=False)
+        # Suppress invalid pixels from bad mask planes
+        bad_mask_bits = exposure.mask.getPlaneBitMask(self.config.bad_mask_planes)
+        invalid = (binned_mask & bad_mask_bits) != 0
+        binned_array = binned_array.copy()
+        binned[invalid] = 0.0
+
+        # Calculate hessian matrix
+        h_elems = hessian_matrix(
+            binned_array,
+            sigma=self.config.sigma,
+            order='rc',
+            use_gaussian_derivatives=True,
+        )
         maxima_ridges, minima_ridges = hessian_matrix_eigvals(h_elems)
-        
-        # Now we create a binary image 
-        # Setting this threshold has been tricky
-        threshold = self.config.threshold
-        binary_ridges = minima_ridges < threshold
-        binary_ridges = binary_ridges.astype(np.uint8)
-        
-        # Set edges of binary_ridges to zero
-        edge = self.config.edge
-        binary_ridges[:,0:edge] = 0
-        binary_ridges[:,-edge:-1] = 0
-        binary_ridges[0:edge,:] = 0
-        binary_ridges[-edge:-1,:] = 0
-        
-        # Convert to 0 -> 255
-        _, binary = cv2.threshold(binary_ridges, 0.5, 255, cv2.THRESH_BINARY)
-        
-        # Find connected regions
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-        
-        # Sort to find regions with long aspect ratios
-        long_labels = []
-        aspect = self.config.aspect
-        for i in range(num_labels):
-            mask = np.uint8(labels == i)
-            # Extract points (x,y) of this component
-            ys, xs = np.where(mask > 0)
-            points = np.column_stack((xs, ys))
-            rect = cv2.minAreaRect(points)
-            (center, (width, height), angle) = rect
-            if height > 0 and width > 0:
-                aspect_ratio = max(width, height) / min(width, height)
-            else:
-                aspect_ratio = 0  # Handle division by zero for flat regions
-            if aspect_ratio > aspect:
-                long_labels.append(i)
-    
-        r, c = arr.shape # Debugging code: swapped c, r to r, c
-        # Fit lines to the longest ones
+
+        # Calculate binary array by thresholding
+        valid_ridges = minima_ridges[~invalid]
+        mad = median_abs_deviation(valid_ridges, scale="normal")
+        threshold = np.median(valid_ridges) - self.config.threshold_nsig * mad
+        binary_array = minima_ridges < threshold
+        binary_array[invalid] = False
+
         lines = []
+        labels = label(binary_array, connectivity=2)
+        for region in regionprops(labels):
 
-        for label in long_labels:
-            mask = np.uint8(labels == label)
-            # Extract points (x,y) of this component
-            ys, xs = np.where(mask > 0)
+            # Skip tiny regions
+            if region.area < self.config.min_area:  # add new configuration
+                continue
 
-            line = fit_line_from_xy(xs, ys)
-            line.rescale(float(bin_size))
-            lines.append(line)
+            if region.eccentricity < self.config.eccentricity: # add new configuration
+                continue
+
+            coords = region.coords
+            ys = coords[:, 0]
+            xs = coords[:, 1]
+
+            weights = np.abs(minima_ridges[ys, xs])
+            line = fit_line_from_xy(xs, ys, weights=weights)
+
+            transform = geom.AffineTransform(
+                geom.LinearTransform.makeScaling(bin_size),
+                geom.Extent2D(0.5 * (bin_size - 1), 0.5 * (bin_size - 1)),
+            )
+
+            lines.append(line.transformed(transform))
 
         return Struct(
             lines=lines,

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import math
+from typing import Any
+
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 import lsst.geom as geom
-from lsst.afw.geom import TransformPoint2ToPoint2
 
 
 class Line2D:
@@ -31,7 +32,7 @@ class Line2D:
         line : `Line2D`
             An instance of `Line2D` defined by the two points.
         """
-        return cls.from_point_and_direction(p1, p1 - p2)
+        return cls.from_point_and_direction(p1, p2 - p1)
 
     @classmethod
     def from_point_and_direction(cls, point: geom.Point2D, direction: geom.Extent2D) -> Line2D:
@@ -90,44 +91,76 @@ class Line2D:
         """The point on the line closest to the origin."""
         return geom.Point2D(self.normal * self.rho)
 
-    def rescale(self, factor: float) -> None:
-        """Rescale the perpendicular distance to the origin.
+    def rotated(self, angle: geom.Angle) -> Line2D:
+        """Apply a rotational transform to the line.
+
+        Parameters
+        ----------
+        angle : `lsst.geom.Angle`
+            The angle to rotate the line by.
+
+        Returns
+        -------
+        new_line : `Line2D`
+            A new rotated line.
+        """
+        return self.transformed(geom.AffineTransform.makeRotation(angle))
+
+    def scaled(self, factor: float) -> Line2D:
+        """Apply a scaling transform to the line.
         
         Parameters
         ----------
         factor : `float`
-            The factor to rescale by.
+            The factor to scale the line by.
+
+        Returns
+        -------
+        new_line : `Line2D`
+            A new scaled line.
         """
-        self._rho *= factor
+        return self.transformed(geom.AffineTransform.makeScaling(factor))
 
-    def shift(self) -> None:
-        """Translate origin and update rho."""
-        ...
-
-    def transformed(self, transform: TransformPoint2ToPoint2) -> Line2D:
-        """Transform this line into a new coordinate system.
+    def translated(self, offset: geom.Extent2D) -> Line2D:
+        """Apply a translation transform to the line.
         
-        The transformation is applied by transforming two points on the line
-        and constructing a new line from the transformed points. This allows
-        the line parameters in Hesse normal form to be mapped through 
-        arbitrary 2D coordinate transforms
+        Parameters
+        ----------
+        offset : `lsst.geom.Extent2D`
+            The offset to translate the line by.
+
+        Returns
+        -------
+        new_line : `Line2D`
+            A new shifted line.
+        """
+        return self.transformed(geom.AffineTransform.makeTranslation(translation))
+
+    def transformed(self, transform: Any, baseline: float = 10.0) -> Line2D:
+        """Apply a geometric transform to the line.
+        
+        The supplied transform maps points expressed in the current coordinate
+        system into points in the target coordinate system.
 
         Parameters
         ----------
         transform : `lsst.afw.geom.TransformPoint2ToPoint2`
             Transform that maps points from the current coordinate system into
             the target coordinate system.
+        baseline : `float`, optional
+            The distance between the two points to be transformed (10.0, by
+            default).
 
         Returns
         -------
-        line : `Line2D`
+        new_line : `Line2D`
             A new line in the target coordinate system.    
         """
         p0 = self.point
-        p1 = p0 + self.direction
+        p1 = p0 + self.direction * baseline
 
-        p0_t = transform.applyForward(p0)
-        p1_t = transform.applyForward(p1)
+        p0_t = _apply_transform(transform, p0)
+        p1_t = _apply_transform(transform, p1)
 
         return Line2D.from_points(p0_t, p1_t)
 
@@ -152,10 +185,10 @@ class Line2D:
             Raised if the line does not intersect the box in exactly two
             points.
         """
-        xmin = bbox.minX
-        xmax = bbox.maxX
-        ymin = bbox.minY
-        ymax = bbox.maxY
+        xmin = box.minX
+        xmax = box.maxX
+        ymin = box.minY
+        ymax = box.maxY
 
         p0 = self.point
         d = self.direction
@@ -184,6 +217,38 @@ class Line2D:
         return unique[0], unique[1]
 
     @staticmethod
+    def _apply_transform(transform: Any, point: geom.Point2D) -> geom.Point2D:
+        """Apply a transform to a point.
+
+        Apply a transformation to a point either by calling the applyForward 
+        method of the object or calling the object directly.
+
+        Parameters
+        ----------
+        transform:
+            The object the encapsulates the transformation.
+        point: `lsst.geom.Point2D`
+            The point to transform.
+
+        Returns
+        -------
+        transformed_point : `lsst.geom.Point2D`
+            The transformed point.
+
+        Raises
+        ------
+        TypeError
+            Raised if ``transform`` does not have a valid callable interface.
+        """
+        if hasattr(transform, "applyForward"):
+            return transform.applyForward(point)
+
+        if callable(transform):
+            return transform(point)
+
+        raise TypeError("transform is invalid callable or object")
+
+    @staticmethod
     def _canonicalize(rho: float, theta: geom.Angle) -> tuple[float, geom.Angle]:
         """Convert line parameters to a canonical Hesse normal form.
 
@@ -208,6 +273,14 @@ class Line2D:
             rho = -rho
         
         return rho, theta_rad * geom.radians
+
+
+@dataclass
+def LineSegment2D:
+    """A line segment geometric primitive."""
+    line: Line2D
+    center: geom.Point2D
+    half_length = float
 
 
 def embed_rho_theta(
@@ -239,25 +312,67 @@ def embed_rho_theta(
 
     return embedded_points
 
-def fit_line_from_xy(x: ArrayLike, y: ArrayLike) -> Line2D:
-    """Fit a line to x/y arrays.
 
-    Used by SatChecker, should exist outside DM code.
-    """
+def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = None) -> Line2D:
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
+
+    if weights is None:
+        weights = np.ones_like(x, dtype=np.float64)
+    else:
+        weights = np.asarray(weights, dtype=np.float64)
 
     if x.shape != y.shape:
         raise ValueError("x and y must have the same shape")
 
-    points = np.column_stack((x, y))
-    centroid = points.mean(axis=0)
+    if weights.shape != x.shape:
+        raise ValueError("weights must have same shape as x/y")
 
-    _, _, vh = np.linalg.svd(points - centroid)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights > 0)
+    if np.count_nonzero(valid) < 2:
+        raise ValueError("need at least two valid weighted points")
+
+    x = x[valid]
+    y = y[valid]
+    w = weights[valid]
+
+    wsum = np.sum(w)
+    centroid = np.array([np.sum(w * x) / wsum, np.sum(w * y) / wsum], dtype=np.float64)
+
+    points = np.column_stack((x, y))
+    centered = points - centroid
+    weighted = centered * np.sqrt(weights[:, np.newaxis])
+
+    _, _, vh = np.linalg.svd(weighted)
     normal = vh[-1]
+    normal /= np.linalg.norm(normal)
 
     rho = float(np.dot(centroid, normal))
     theta = math.atan2(normal[1], normal[0])
 
-    return Line2D(rho, theta * geom.radians)
+    # info = _calculate_fit_info(centered, weights, normal)
+    # center = centroid
 
+    return Line2D(rho, theta * geom.radians) # center, info 
+
+
+def _calculate_fit_info(centered: NDarray, weights: NDarray, normal: NDarray):
+
+    wsum = np.sum(weights)
+    neff = (wsum ** 2) / np.sum(weights ** 2)
+
+    residuals = centered @ normal
+    chi2 = np.sum(weights * residuals**2)
+    sigma2 = chi2 / wsum
+    rms = float(np.sqrt(sigma2))
+
+    direction = np.array([-normal[1], normal[0]])
+    proj = centered @ direction
+    half_length = 0.5 * (proj.max() - proj.min())
+    length2 = np.sum(weights * proj**2)
+
+    var_theta = sigma2 / max(length2, 1e-12)
+    var_rho = sigma2 / max(neff, 1e-12)
+    covariance = np.array([[var_rho, 0.0], [0.0, var_theta]])
+
+    return covariance, rms, chi2, half_length
