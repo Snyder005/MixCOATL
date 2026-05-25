@@ -23,6 +23,10 @@ class LineGeometry2D(ABC):
         ...
 
     @abstractmethod
+    def as_line(self) -> Line2D:
+        ...
+
+    @abstractmethod
     def at(self, s: float) -> geom.Point2D:
         """Evaluate geometry at parameter s."""
         ...
@@ -58,10 +62,7 @@ class LineGeometry2D(ABC):
         if interval is None:
             return None
 
-        p0 = self.at(interval.min)
-        p1 = self.at(interval.max)
-
-        return LineSegment2D.from_points(p0, p1)
+        return LineSegment2D(self.as_line(), interval=interval)
 
     def intersection(self, box: geom.Box2D | geom.Box2I) -> LineSegment2D | None:
         """Return intersection with a box.
@@ -231,6 +232,9 @@ class Line2D(LineGeometry2D):
         """The point on the line closest to the origin."""
         return geom.Point2D(self.normal * self.rho)
 
+    def as_line(self) -> Line2D:
+        return self
+
     def at(self, s: float) -> geom.Point2D:
         return self.origin + self.direction * s
 
@@ -353,6 +357,9 @@ class LineSegment2D(LineGeometry2D):
     @property
     def half_length(self) -> float:
         return 0.5 * self.length
+
+    def as_line(self) -> Line2D:
+        return self.line
 
     def at(self, s: float) -> geom.Point2D:
         return self.line.at(s)
