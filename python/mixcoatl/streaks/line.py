@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Self
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -9,22 +11,169 @@ from numpy.typing import ArrayLike, NDArray
 import lsst.geom as geom
 
 
+class LineGeometry2D(ABC):
+    """Abstract base class for transformable line geometries."""
+
+    @classmethod
+    @abstractmethod
+    def from_points(cls, p0: geom.Point2D, p1: geom.Point2D) -> Self:
+        """Construct line geometry from two defining points."""
+        ...
+
+    @abstractmethod
+    def at(self, s: float) -> geom.Point2D:
+        """Evaluate geometry at parameter s."""
+        ...
+
+    def clipped_to(self, box: geom.Box2D | geom.Box2I) -> Self | None:
+        """Clip line geometry to a box."""
+        interval = self._interval_in_box(box)
+
+        if interval is None:
+            return None
+
+        p0 = self._evaluate(interval.min)
+        p1 = self._evalue(interval.max)
+
+        return type(self).from_points(p0, p1)
+
+    def transformed(self, transform: Any, baseline: float = 10.0) -> Self:
+        """Apply a geometric transformation.
+        
+        The supplied transform maps points expressed in the current coordinate
+        system into points in the target coordinate system.
+
+        Parameters
+        ----------
+        transform : `lsst.afw.geom.TransformPoint2ToPoint2`
+            Transform that maps points from the current coordinate system into
+            the target coordinate system.
+        baseline : `float`, optional
+            The distance between the two points to be transformed (10.0, by
+            default).
+
+        Returns
+        -------
+        transformed : `Line2D`
+            A new line in the target coordinate system.    
+        """
+        p0, p1 = self.defining_points()
+
+        p0_t = _LineGeometry2D._apply_transform(transform, p0)
+        p1_t = _LineGeometry2D._apply_transform(transform, p1)
+
+        return type(self).from_points(p0_t, p1_t)
+
+   def rotated(self, angle: geom.Angle) -> Self:
+        """Apply a rotational transformation.
+
+        Parameters
+        ----------
+        angle : `lsst.geom.Angle`
+            The angle to rotate by.
+
+        Returns
+        -------
+        transformed :
+            The transformed object.
+        """
+        return self.transformed(geom.AffineTransform.makeRotation(angle))
+
+    def scaled(self, factor: float) -> Self:
+        """Apply a scaling transformation.
+        
+        Parameters
+        ----------
+        factor : `float`
+            The factor to scale by.
+
+        Returns
+        -------
+        transformed :
+            The transformed object.
+        """
+        return self.transformed(geom.AffineTransform.makeScaling(factor))
+
+    def translated(self, offset: geom.Extent2D) -> Self:
+        """Apply a translation transformation.
+        
+        Parameters
+        ----------
+        offset : `lsst.geom.Extent2D`
+            The offset to translate by.
+
+        Returns
+        -------
+        transformed :
+            The transformed object.
+        """
+        return self.transformed(geom.AffineTransform.makeTranslation(translation))
+
+    @abstractmethod
+    def _defining_points(self) -> tuple[geom.Point2D, geom.Point2D]:
+        """Return two points defining the line geometry."""
+        ...
+
+    @abstractmethod
+    def _interval_in_box(self, box: geom.Box2I | geom.Box2D) -> geom.IntervalD | None:
+        """Return valid parameter interval in box."""
+        ...
+
+    @abstractmethod
+    def _evaluate(self, s: float) -> geom.Point2D:
+        """Evaluate point along line geometry."""
+        ...
+
+    @staticmethod
+    def _apply_transform(transform: Any, point: geom.Point2D) -> geom.Point2D:
+        """Apply a transform to a point.
+
+        Apply a transformation to a point either by calling the applyForward 
+        method of the object or calling the object directly.
+
+        Parameters
+        ----------
+        transform:
+            The object the encapsulates the transformation.
+        point: `lsst.geom.Point2D`
+            The point to transform.
+
+        Returns
+        -------
+        transformed : `lsst.geom.Point2D`
+            The transformed point.
+
+        Raises
+        ------
+        TypeError
+            Raised if ``transform`` does not have a valid callable interface.
+        """
+        if hasattr(transform, "applyForward"):
+            return transform.applyForward(point)
+
+        if callable(transform):
+            return transform(point)
+
+        raise TypeError("transform is invalid callable or object")
+
+
+
 class Line2D:
 
     def __init__(self, rho: float, theta: geom.Angle):
-        rho, theta = self._canonicalize(rho, theta)
+        rho, theta = Line2D._canonicalize(rho, theta)
         self._rho = rho
         self._theta = theta
 
     @classmethod
-    def from_points(cls, p1: geom.Point2D, p2: geom.Point2D) -> Line2D:
+    def from_points(cls, p0: geom.Point2D, p1: geom.Point2D) -> Self:
         """Create a `Line2D` instance from two points.
 
         Parameters
         ----------
-        p1 : `lsst.geom.Point2D`
+        p0 : `lsst.geom.Point2D`
             A point on the line.
-        p2 : `lsst.geom.Point2D`
+        p1 : `lsst.geom.Point2D`
             A second point on the line.
 
         Returns
@@ -32,10 +181,10 @@ class Line2D:
         line : `Line2D`
             An instance of `Line2D` defined by the two points.
         """
-        return cls.from_point_and_direction(p1, p2 - p1)
+        return cls.from_point_and_direction(p0, p1 - p0)
 
     @classmethod
-    def from_point_and_direction(cls, point: geom.Point2D, direction: geom.Extent2D) -> Line2D:
+    def from_point_and_direction(cls, point: geom.Point2D, direction: geom.Extent2D) -> Self:
         """Create a `Line2D` instance from a point and a direction.
 
         Parameters
@@ -58,8 +207,10 @@ class Line2D:
         if (norm := direction.computeNorm()) == 0:
             raise ValueError("direction vector must be non-zero")
 
-        normal = geom.Extent2D(-direction.y, direction.x) / norm
-        rho = point.x * normal.x + point.y * normal.y
+        direction = direction / norm
+        normal = geom.Extent2D(-direction.y, direction.x)
+
+        rho = Line2D._dot(geom.Extent2D(point), normal)
         theta = math.atan2(normal.y, normal.x) * geom.radians
 
         return cls(rho, theta)
@@ -87,82 +238,31 @@ class Line2D:
         return geom.Extent2D(-math.sin(t), math.cos(t))
 
     @property
-    def point(self) -> geom.Point2D:
+    def origin(self) -> geom.Point2D:
         """The point on the line closest to the origin."""
         return geom.Point2D(self.normal * self.rho)
 
-    def rotated(self, angle: geom.Angle) -> Line2D:
-        """Apply a rotational transform to the line.
+    def project(self, point: geom.Point2D) -> float:
+        """Project a point onto the line coordinate system.
 
         Parameters
         ----------
-        angle : `lsst.geom.Angle`
-            The angle to rotate the line by.
+        point : `lsst.geom.Point2D`
+            Point to project.
 
         Returns
         -------
-        new_line : `Line2D`
-            A new rotated line.
+        s : `float`
+            Signed longitudinal coordinate along the line direction relative
+            to the point closest to the origin.
         """
-        return self.transformed(geom.AffineTransform.makeRotation(angle))
+        delta = point - self.origin
+        return Line2D._dot(delta, self.direction)
 
-    def scaled(self, factor: float) -> Line2D:
-        """Apply a scaling transform to the line.
-        
-        Parameters
-        ----------
-        factor : `float`
-            The factor to scale the line by.
-
-        Returns
-        -------
-        new_line : `Line2D`
-            A new scaled line.
-        """
-        return self.transformed(geom.AffineTransform.makeScaling(factor))
-
-    def translated(self, offset: geom.Extent2D) -> Line2D:
-        """Apply a translation transform to the line.
-        
-        Parameters
-        ----------
-        offset : `lsst.geom.Extent2D`
-            The offset to translate the line by.
-
-        Returns
-        -------
-        new_line : `Line2D`
-            A new shifted line.
-        """
-        return self.transformed(geom.AffineTransform.makeTranslation(translation))
-
-    def transformed(self, transform: Any, baseline: float = 10.0) -> Line2D:
-        """Apply a geometric transform to the line.
-        
-        The supplied transform maps points expressed in the current coordinate
-        system into points in the target coordinate system.
-
-        Parameters
-        ----------
-        transform : `lsst.afw.geom.TransformPoint2ToPoint2`
-            Transform that maps points from the current coordinate system into
-            the target coordinate system.
-        baseline : `float`, optional
-            The distance between the two points to be transformed (10.0, by
-            default).
-
-        Returns
-        -------
-        new_line : `Line2D`
-            A new line in the target coordinate system.    
-        """
-        p0 = self.point
-        p1 = p0 + self.direction * baseline
-
-        p0_t = _apply_transform(transform, p0)
-        p1_t = _apply_transform(transform, p1)
-
-        return Line2D.from_points(p0_t, p1_t)
+    def distance(self, point: geom.Point2D) -> float:
+        """Compute the signed perpendicular distance to the line."""
+        delta = point - self.origin
+        return Line2D._dot(delta, self.normal)
 
     def get_box_intercepts(self, box: geom.Box2I) -> tuple[geom.Point2D, geom.Point2D]:
         """Calculate the intersection points between the line and a box.
@@ -216,37 +316,18 @@ class Line2D:
 
         return unique[0], unique[1]
 
-    @staticmethod
-    def _apply_transform(transform: Any, point: geom.Point2D) -> geom.Point2D:
-        """Apply a transform to a point.
+    def _defining_points(self) -> tuple[geom.Point2D, geom.Point2D]:
+        """Return two points defining the line."""
+        p0 = self.origin
+        p1 = self.at(self._TRANSFORM_BASELINE)
 
-        Apply a transformation to a point either by calling the applyForward 
-        method of the object or calling the object directly.
+        return p0, p1
 
-        Parameters
-        ----------
-        transform:
-            The object the encapsulates the transformation.
-        point: `lsst.geom.Point2D`
-            The point to transform.
+    def _evaluate(self, s: float) -> geom.Point2D:
+        return self.origin + self.direction * s
 
-        Returns
-        -------
-        transformed_point : `lsst.geom.Point2D`
-            The transformed point.
-
-        Raises
-        ------
-        TypeError
-            Raised if ``transform`` does not have a valid callable interface.
-        """
-        if hasattr(transform, "applyForward"):
-            return transform.applyForward(point)
-
-        if callable(transform):
-            return transform(point)
-
-        raise TypeError("transform is invalid callable or object")
+    def _line_coordinate_interval_in_box(self, box: geom.Box2D | geom.Box2I):
+        return _line_box_interval(self, box)
 
     @staticmethod
     def _canonicalize(rho: float, theta: geom.Angle) -> tuple[float, geom.Angle]:
@@ -274,14 +355,69 @@ class Line2D:
         
         return rho, theta_rad * geom.radians
 
+    @staticmethod
+    def _dot(v1: geom.Extent2D, v2: geom.Extent2D) -> float:
+        """Compute the Euclidean dot product of two vectors."""
+        return v1.x * v2.x + v1.y * v2.y
 
-@dataclass
-def LineSegment2D:
+
+@dataclass(frozen=True)
+class LineSegment2D:
     """A line segment geometric primitive."""
     line: Line2D
-    center: geom.Point2D
-    half_length = float
+    interval: geom.IntervalD
 
+    def from_points(cls, p0: geom.Point2D, p1: geom.Point2D) -> Self:
+        line = Line2D.from_points(p0, p1)
+        interval = geom.IntervalD.fromSpannedPoints(line.project(p0), line.project(p1))
+
+        return cls(line, interval)
+
+    def from_center_length(cls, line: Line2D, center: float, length: float) -> Self:
+        h = 0.5 * length
+        interval = geom.IntervalD.fromSpannedPoints((center - h, center + h))
+        return cls(line, interval)
+
+    @property
+    def p0(self) -> geom.Point2D:
+        return self.line.at(self.interval.min)
+
+    @property
+    def p1(self) -> geom.Point2D:
+        return self.line.at(self.interval.max)
+
+    @property
+    def center(self) -> geom.Point2D:
+        return self.line.at(self.interval.center)
+
+    @property
+    def length(self) -> float:
+        return self.interval.size
+
+    @property
+    def half_length(self) -> float:
+        return 0.5 * self.length
+
+    def _defining_points(self) -> tuple[geom.Point2D, geom.point2D]:
+        """Return segment endpoints."""
+        return self.p0, self.p1
+
+    def _evaluate(self, s: float) -> Point2D:
+        return self.line._evaluate(s)
+
+    def _line_coordinate_interval_in_box(self, box: geom.Box2I | box: geom.Box2D):
+        box_interval = _line_box_interval(self.line, box)
+
+        if box_interval is None:
+            return None
+
+        smin = max(self.interval.min, box_interval.min)
+        smax = min(self.interval.max, box_interval.max)
+
+        if smin > smax:
+            return None
+
+        return geom.IntervalD.fromSpannedPoints([smin, smax])
 
 def embed_rho_theta(
         rho: ArrayLike,
@@ -313,7 +449,21 @@ def embed_rho_theta(
     return embedded_points
 
 
-def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = None) -> Line2D:
+def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = None) -> LineSegment2D:
+    """Fit a weighted line segment to 2D points.
+
+    Parameters
+    ----------
+    x, y : array-like
+        Point coordinates.
+    weights : array-like, optional
+        Non-negative point weights.
+
+    Returns
+    -------
+    segment : `LineSegment2D`
+        Best-fit finite line segment.
+    """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
 
@@ -341,7 +491,7 @@ def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = Non
 
     points = np.column_stack((x, y))
     centered = points - centroid
-    weighted = centered * np.sqrt(weights[:, np.newaxis])
+    weighted = centered * np.sqrt(w[:, np.newaxis])
 
     _, _, vh = np.linalg.svd(weighted)
     normal = vh[-1]
@@ -349,11 +499,14 @@ def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = Non
 
     rho = float(np.dot(centroid, normal))
     theta = math.atan2(normal[1], normal[0])
+    line = Line2D(rho, theta * geom.radians)
 
     # info = _calculate_fit_info(centered, weights, normal)
-    # center = centroid
 
-    return Line2D(rho, theta * geom.radians) # center, info 
+    projections = [line.project(geom.Point2D(px, py)) for px, py in zip(x, y, strict=True)]
+    interval = geom.IntervalD.fromSpannedPoints(projections)
+
+    return LineSegment2D(line=line, interval=interval) 
 
 
 def _calculate_fit_info(centered: NDarray, weights: NDarray, normal: NDarray):
