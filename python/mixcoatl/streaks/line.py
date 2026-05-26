@@ -41,7 +41,7 @@ class LineGeometry2D(ABC):
         self,
         box: geom.Box2I | geom.Box2D,
         atol: float = 1e-12,
-    ) -> list[geom.Point2D]
+    ) -> list[geom.Point2D]:
         """Return intersection points with a box boundary."""
         ...
 
