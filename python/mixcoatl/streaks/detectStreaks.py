@@ -1,13 +1,13 @@
-# Can return Line2D plus a line segment representation (center/half-length), plus line fit statistics.
 import numpy as np
+from scipy.ndimage import binary_dilation
 from skimage.feature import hessian_matrix, hessian_matrix_eigvals
 
 import lsst.afw.math as afwMath
 import lsst.geom as geom
 from lsst.pex.config import Config, Field
 from lsst.pipe.base import Struct, Task
-from mixcoatl.streaks.line import fit_line_from_xy
-
+from mixcoatl.streaks.line import fit_line_segment_from_xy
+from mixcoatl.streaks.table import StreakAdapter, StreakSchema
 
 class KHTDetectConfig(Config):
     ...
@@ -23,20 +23,15 @@ class KHTDetectTask(Task):
 class HessianDetectConfig(Config):
     """Configurable parameters for StreakFinderTask.
     """
-    bin_size = Field(
-        doc="Size of superpixel bins.",
-        dtype=int,
-        default=4
-    )
     sigma = Field(
         doc="Size of the Gaussian kernel sigma used to compute the Hessian second derivatives.",
         dtype=float,
-        default=12.0,
+        default=3.0,
     )
     threshold_nsig = Field(
         doc="Threshold number of sigma applied to the Hessian minima ridges eigenvalue array.",
         dtype=float,
-        default=5.0,
+        default=4.0,
     )
     eccentricity = Field(
         doc="Lower bound for the eccentricity of the the minima regions.",
@@ -46,7 +41,7 @@ class HessianDetectConfig(Config):
     min_area = Field(
         doc="Mininum pixel area of minima regions.",
         dtype=int,
-        default=5,
+        default=64,
     )
     bad_mask_planes = ListField(
         doc="Names of mask plane regions to ignore when doing streak detection.",
@@ -65,22 +60,18 @@ class HessianDetectTask(Task):
         table = afwTable.SourceTable.make(schema)
         catalog = afwTable.SourceCatalog(table)
 
-        # Bin exposure image and mask
-        bin_size = self.config.bin_size
         masked_image = exposure.getMaskedImage()
-        binned_image = afwMath.binImage(masked_image, bin_size)
-        binned_array = binned.image.array.astype(np.float32, copy=False)        
-        binned_mask = binned.mask.array
+        image = masked_image.image.array.astype(np.float32, copy=False)
+        mask = masked_image.mask.array
 
         # Suppress invalid pixels from bad mask planes
         bad_mask_bits = exposure.mask.getPlaneBitMask(self.config.bad_mask_planes)
-        invalid = (binned_mask & bad_mask_bits) != 0
-        binned_array = binned_array.copy()
-        binned[invalid] = 0.0
+        invalid = (mask & bad_mask_bits) != 0
+        grown_invalid = binary_dilation(invalid, iterations=max(1, int(np.ceil(2 * self.config.sigma))))
 
         # Calculate hessian matrix
         h_elems = hessian_matrix(
-            binned_array,
+            image,
             sigma=self.config.sigma,
             order='rc',
             use_gaussian_derivatives=True,
@@ -88,47 +79,56 @@ class HessianDetectTask(Task):
         maxima_ridges, minima_ridges = hessian_matrix_eigvals(h_elems)
 
         # Calculate binary array by thresholding
-        valid_ridges = minima_ridges[~invalid]
-        mad = median_abs_deviation(valid_ridges, scale="normal")
-        threshold = np.median(valid_ridges) - self.config.threshold_nsig * mad
-        binary_array = minima_ridges < threshold
-        binary_array[invalid] = False
+        valid_ridges = minima_ridges[~grown_invalid]
+        if valid_ridges.size == 0:
+            return Struct(
+                streak_catalog=catalog,
+                minima_ridges=minima_ridges,
+                binary_ridges=np.zeros_like(minima_ridges, dtype=bool),
+            )
 
-        labels = label(binary_array, connectivity=2)
+        mad = median_abs_deviation(valid_ridges, scale="normal")
+        if mad <= 0 or not np.isfinite(mad):
+            mad = np.std(valid_ridges)
+
+        threshold = np.median(valid_ridges) - self.config.threshold_nsig * mad
+        binary = minima_ridges < threshold
+        binary[grown_invalid] = False
+
+        labels = label(binary, connectivity=2)
         for region in regionprops(labels):
 
-            # Skip tiny regions
-            if region.area < self.config.min_area:  # add new configuration
+            if region.area < self.config.min_area:
                 continue
 
-            if region.eccentricity < self.config.eccentricity: # add new configuration
+            if region.eccentricity < self.config.eccentricity:
                 continue
 
             coords = region.coords
             ys = coords[:, 0]
             xs = coords[:, 1]
+            if np.any(grown_invalid[ys, xs]):
+                continue
 
             weights = np.abs(minima_ridges[ys, xs])
             line_segment = fit_line_segment_from_xy(xs, ys, weights=weights)
 
-            transform = geom.AffineTransform(
-                geom.LinearTransform.makeScaling(bin_size),
-                geom.Extent2D(0.5 * (bin_size - 1), 0.5 * (bin_size - 1)),
-            )
+            span_list: list[afwGeom.Span] = []
+            for y in np.unique(ys):
+                x_row = xs[ys == y]
+                span_list.append(afwGeom.Span(int(y), int(x_row.min()), int(x_row.max())))
 
-            line_segment = line_segment.transformed(transform)
+            spans = afwGeom.SpanSet(span_list)
+            footprint = afwDetect.Footprint(spans)
 
             record = catalog.addNew()
             streak = StreakAdapter(record)
             streak.line_segment = line_segment
-            streak["detector"] = exposure.info.detector.getId() # check this in notebook
-
-#            spans = afwGeom.SpanSet.fromShape(...)
-#            footprint = afwDetect.Footprint(spans)
-#            streak.footprint = footprint
+            streak["detector"] = exposure.info.detector.getId()
+            streak.footprint = footprint
 
         return Struct(
             streak_catalog=catalog,
             minima_ridges=minima_ridges,
-            binary_ridges=binary_ridges,
+            binary_ridges=binary,
         )

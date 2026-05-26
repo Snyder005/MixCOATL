@@ -439,7 +439,7 @@ def embed_rho_theta(
     return embedded_points
 
 
-def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = None) -> LineSegment2D:
+def fit_line_segment_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = None) -> LineSegment2D:
     """Fit a weighted line segment to 2D points.
 
     Parameters
@@ -491,8 +491,6 @@ def fit_line_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | None = Non
     theta = math.atan2(normal[1], normal[0])
     line = Line2D(rho, theta * geom.radians)
 
-    # info = _calculate_fit_info(centered, weights, normal)
-
     projections = [line.project(geom.Point2D(px, py)) for px, py in zip(x, y, strict=True)]
     interval = geom.IntervalD.fromSpannedPoints(projections)
 
@@ -529,28 +527,6 @@ def _apply_transform(transform: Any, point: geom.Point2D) -> geom.Point2D:
         return transform(point)
 
     raise TypeError("transform is invalid callable or object")
-
-
-def _calculate_fit_info(centered: NDarray, weights: NDarray, normal: NDarray):
-
-    wsum = np.sum(weights)
-    neff = (wsum ** 2) / np.sum(weights ** 2)
-
-    residuals = centered @ normal
-    chi2 = np.sum(weights * residuals**2)
-    sigma2 = chi2 / wsum
-    rms = float(np.sqrt(sigma2))
-
-    direction = np.array([-normal[1], normal[0]])
-    proj = centered @ direction
-    half_length = 0.5 * (proj.max() - proj.min())
-    length2 = np.sum(weights * proj**2)
-
-    var_theta = sigma2 / max(length2, 1e-12)
-    var_rho = sigma2 / max(neff, 1e-12)
-    covariance = np.array([[var_rho, 0.0], [0.0, var_theta]])
-
-    return covariance, rms, chi2, half_length
 
 
 def _canonicalize(rho: float, theta: geom.Angle) -> tuple[float, geom.Angle]:
