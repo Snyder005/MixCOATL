@@ -1,46 +1,71 @@
 # Why mix type definitions in the schema? E.g. "I" vs np.int32?
+# Optional Upgrades:
+#   * Convenience geometric properties (center, length, p0, p1): 
+#     These may be useful for downstream analysis code/ML labeling
 import numpy as np
 
+import lsst.afw.detection as afwDetect
 import lsst.afw.table as afwTable
 import lsst.geom as geom
 from mixcoatl.streaks.line import Line2D, LineSegment2D
 
 
-class StreakRecord(afwTable.BaseRecord):
+class StreakAdapter:
 
-    def getLine(self) -> Line2D:
+    def __init__(self, record: afwTable.SourceRecord):
+        self._record = record
+
+    def __repr__(self):
+        seg = self.line_segment
+
+        return (
+            f"StreakAdapter("
+            f"rho={seg.line.rho:.2f}, "
+            f"theta={seg.line.theta.asDegrees():.2f} deg, "
+            f"length={seg.length:.2f})"
+        )
+
+    def __getitem__(self, key):
+        return self._record[key]
+
+    def __setitem__(self, key, value):
+        self._record[key] = value
+
+    @property
+    def record(self) -> afwTable.SourceRecord:
+        return self._record
+
+    @property
+    def line(self) -> Line2D:
         return Line2D(rho=self["line_rho"], theta=self["line_theta"])
 
-    def getLineSegment(self) -> LineSegment2D:
+    @property
+    def line_segment(self) -> LineSegment2D:
         return LineSegment2D.from_center_length(
-            line=self.getLine(),
+            line=self.line,
             u_center=self["line_u_center"],
             length=self["line_length"],
         )
 
-    def setLineSegment(self, segment: LineSegment2D) -> None:
+    @line_segment.setter
+    def line_segment(self, segment: LineSegment2D) -> None:
         self["line_rho"] = segment.line.rho
         self["line_theta"] = segment.line.theta
         self["line_u_center"] = segment.interval.center
         self["line_length"] = segment.length
 
-#    def getOrientedBBox(self):
-#        ...
+    @property
+    def footprint(self) -> afwDetect.Footprint:
+        return self.record.getFootprint()
 
+    @footprint.setter
+    def footprint(self, footprint: afwDetect.Footprint) -> None:
+        self.record.setFootprint(footprint)
 
-class StreakTable(afwTable.SourceTable):
-
-    def __init__(self, schema):
-        super().__init__(schema)
-
-        #self.rhoKey = schema["line_rho"].asKey()
-
-    @classmethod
-    def make(cls, schema):
-        ...
+class StreakSchema:
 
     @staticmethod
-    def makeMinimalSchema():
+    def makeMinimalSchema() -> afwTable.Schema:
 
         schema = afwTable.SourceTable.makeMinimalSchema()
 
@@ -72,14 +97,7 @@ class StreakTable(afwTable.SourceTable):
         return schema
 
 
-class StreakCatalog(afwTable.SourceCatalog):
-    """Can add: vectorized geometry helpers, export routines, ML conversion helpers"""
-
-    def addNew(): # return a StreakRecord not SourceRecord
-        ...
-
-
 if __name__ == "__main__":
-    schema = StreakTable.makeMinimalSchema()
-    table = StreakTable.make(schema)
-    catalog = StreakCatalog(table)
+    schema = StreakSchema.makeMinimalSchema()
+    table = afwTable.SourceTable.make(schema)
+    catalog = afwTable.SourceCatalog(table)

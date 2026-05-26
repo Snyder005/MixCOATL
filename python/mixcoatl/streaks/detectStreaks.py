@@ -61,6 +61,10 @@ class HessianDetectTask(Task):
 
     def run(self, exposure):
 
+        schema = StreakSchema.makeMinimalSchema()
+        table = afwTable.SourceTable.make(schema)
+        catalog = afwTable.SourceCatalog(table)
+
         # Bin exposure image and mask
         bin_size = self.config.bin_size
         masked_image = exposure.getMaskedImage()
@@ -90,7 +94,6 @@ class HessianDetectTask(Task):
         binary_array = minima_ridges < threshold
         binary_array[invalid] = False
 
-        lines = []
         labels = label(binary_array, connectivity=2)
         for region in regionprops(labels):
 
@@ -106,17 +109,26 @@ class HessianDetectTask(Task):
             xs = coords[:, 1]
 
             weights = np.abs(minima_ridges[ys, xs])
-            line = fit_line_from_xy(xs, ys, weights=weights)
+            line_segment = fit_line_segment_from_xy(xs, ys, weights=weights)
 
             transform = geom.AffineTransform(
                 geom.LinearTransform.makeScaling(bin_size),
                 geom.Extent2D(0.5 * (bin_size - 1), 0.5 * (bin_size - 1)),
             )
 
-            lines.append(line.transformed(transform))
+            line_segment = line_segment.transformed(transform)
+
+            record = catalog.addNew()
+            streak = StreakAdapter(record)
+            streak.line_segment = line_segment
+            streak["detector"] = exposure.info.detector.getId() # check this in notebook
+
+#            spans = afwGeom.SpanSet.fromShape(...)
+#            footprint = afwDetect.Footprint(spans)
+#            streak.footprint = footprint
 
         return Struct(
-            lines=lines,
+            streak_catalog=catalog,
             minima_ridges=minima_ridges,
             binary_ridges=binary_ridges,
         )
