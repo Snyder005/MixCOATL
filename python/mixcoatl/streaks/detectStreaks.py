@@ -124,7 +124,7 @@ class HessianDetectTask(Task):
             record = catalog.addNew()
             streak = StreakAdapter(record)
             streak.line_segment = line_segment
-            streak["detector"] = exposure.info.detector.getId()
+            streak["detector"] = exposure.detector.getId()
             streak.footprint = footprint
 
         return Struct(
