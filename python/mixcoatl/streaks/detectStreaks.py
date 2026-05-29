@@ -62,46 +62,50 @@ class HessianDetectTask(Task):
 
         masked_image = exposure.getMaskedImage()
         image = masked_image.image.array.astype(np.float32, copy=False)
+        variance = masked_image.variance.array.astype(np.float32, copy=False)
         mask = masked_image.mask.array
+
+        # Variance whitening
+        image /= np.sqrt(np.maximum(variance, 1e-6)
 
         # Suppress invalid pixels from bad mask planes
         bad_mask_bits = exposure.mask.getPlaneBitMask(self.config.bad_mask_planes)
         invalid = (mask & bad_mask_bits) != 0
         grown_invalid = binary_dilation(invalid, iterations=max(1, int(np.ceil(2 * self.config.sigma))))
 
-        # Calculate hessian matrix
-        h_elems = hessian_matrix(
+        vesselness = frangi(
             image,
-            sigma=self.config.sigma,
-            order='rc',
-            use_gaussian_derivatives=True,
-        )
-        maxima_ridges, minima_ridges = hessian_matrix_eigvals(h_elems)
+            sigmas=self.config.sigmas,
+            alpha=self.config.alpha,
+            beta=self.config.beta,
+            gamma=self.config.gamma,
+            black_ridges=False,
+        ) # Need all alpha, beta, gamma for 2-d?
 
         # Calculate binary array by thresholding
-        valid_ridges = minima_ridges[~grown_invalid]
+        valid = vesselness[~grown_invalid]
         if valid_ridges.size == 0:
             return Struct(
                 streak_catalog=catalog,
-                minima_ridges=minima_ridges,
-                binary_ridges=np.zeros_like(minima_ridges, dtype=bool),
+                vesselness=vesselness,
             )
 
-        mad = median_abs_deviation(valid_ridges, scale="normal")
+        mad = median_abs_deviation(valid, scale="normal")
         if mad <= 0 or not np.isfinite(mad):
             mad = np.std(valid_ridges)
 
-        threshold = np.median(valid_ridges) - self.config.threshold_nsig * mad
-        binary = minima_ridges < threshold
-        binary[grown_invalid] = False
+        threshold = np.median(valid) + self.config.threshold_nsig * mad
+        binary = vesselness > threshold
+        binary[grown_invalid] = False # needed?
 
+        # Do simple pixel connectivity to generate an approximate line segment parametrization
         labels = label(binary, connectivity=2)
         for region in regionprops(labels):
 
             if region.area < self.config.min_area:
                 continue
 
-            if region.eccentricity < self.config.eccentricity:
+            if region.eccentricity < self.config.eccentricity: # Better quantity to use (theta mean/std)
                 continue
 
             coords = region.coords
@@ -110,7 +114,7 @@ class HessianDetectTask(Task):
             if np.any(grown_invalid[ys, xs]):
                 continue
 
-            weights = np.abs(minima_ridges[ys, xs])
+            weights = vesselness[ys, xs]
             line_segment = fit_line_segment_from_xy(xs, ys, weights=weights)
 
             span_list: list[afwGeom.Span] = []
@@ -125,10 +129,15 @@ class HessianDetectTask(Task):
             streak = StreakAdapter(record)
             streak.line_segment = line_segment
             streak["detector"] = exposure.detector.getId()
-            streak.footprint = footprint
+            streak.footprint = footprint # may change API to setFootprint to match SourceRecord
+
+            # May propogate in future (but can be calculated from Footprint)
+            #streak["theta_mean"] = theta # calculated from Ixx, Iyy, Ixy of hessian matrix at fp center
+            #streak["theta_std"] = 0.0
+            #streak["ridge_strength"] = np.median(weights) # ridge strength
+            #streak["ridge_width"] = 2.355 * orientation_sigma # ridge width estimate
 
         return Struct(
             streak_catalog=catalog,
-            minima_ridges=minima_ridges,
-            binary_ridges=binary,
+            vesselness=vesselness,
         )
