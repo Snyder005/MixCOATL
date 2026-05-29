@@ -23,15 +23,25 @@ class KHTDetectTask(Task):
 class HessianDetectConfig(Config):
     """Configurable parameters for StreakFinderTask.
     """
-    sigma = Field(
-        doc="Size of the Gaussian kernel sigma used to compute the Hessian second derivatives.",
+    sigmas = ListField(
+        doc="Gaussian scale for multiscale Hessian matrix.",
         dtype=float,
-        default=3.0,
+        default=[1.0, 2.0, 4.0],
     )
-    threshold_nsig = Field(
-        doc="Threshold number of sigma applied to the Hessian minima ridges eigenvalue array.",
+    beta = Field(
+        doc="Frangi correction constant to adjust sensitivity to anisotropy.",
         dtype=float,
-        default=4.0,
+        default=0.5,
+    )
+    gamma = Field(
+        doc="Frangi correction constant to adjust sensitivity to structural strength.",
+        dtype=float,
+        default=2.0,
+    )
+    npix_to_dilate = Field(
+        doc="Number of pixels to dilate the bad mask planes.",
+        dtype=int,
+        default=4,
     )
     eccentricity = Field(
         doc="Lower bound for the eccentricity of the the minima regions.",
@@ -71,7 +81,10 @@ class HessianDetectTask(Task):
         # Suppress invalid pixels from bad mask planes
         bad_mask_bits = exposure.mask.getPlaneBitMask(self.config.bad_mask_planes)
         invalid = (mask & bad_mask_bits) != 0
-        grown_invalid = binary_dilation(invalid, iterations=max(1, int(np.ceil(2 * self.config.sigma))))
+        grown_invalid = binary_dilation(
+            invalid,
+            iterations=max(1, int(np.ceil(2 * self.config.npix_to_dilate))),
+        ) # Can use SpanSet.dilated() and setting a cleared copy of the original mask?
 
         vesselness = frangi(
             image,
