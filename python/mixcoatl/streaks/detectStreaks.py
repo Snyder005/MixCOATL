@@ -1,26 +1,28 @@
+# Notes for testing:
+#   * Need to avoid modifying exposure arrays in-place
+#   * May need to adjust the label connectivity for unbinned image
+# Notes for optimization:
+#   * MAD may become extremely small on empty fields or low-background diffims
+#   * A minimal vesselness value may be needed to remove small Frangi responses
+#   * Could add an adaptive gamma based off of percentile
+#   * Filtering of regions may be better using estimated theta mean/std for all points
+
 import numpy as np
 from scipy.ndimage import binary_dilation
-from skimage.feature import hessian_matrix, hessian_matrix_eigvals
+from scipy.stats import median_abs_deviation
+from skimage.filters import frangi
+from skimage.morphology import remove_small_objects
 
-import lsst.afw.math as afwMath
-import lsst.geom as geom
-from lsst.pex.config import Config, Field
+import lsst.afw.detection as afwDetect
+import lsst.afw.geom as afwGeom
+import lsst.afw.table as afwTable
+from lsst.pex.config import Config, Field, ListField
 from lsst.pipe.base import Struct, Task
 from mixcoatl.streaks.line import fit_line_segment_from_xy
 from mixcoatl.streaks.table import StreakAdapter, StreakSchema
 
-class KHTDetectConfig(Config):
-    ...
 
-class KHTDetectTask(Task):
-    ConfigClass = KHTDetectConfig
-    _DefaultName = "khtDetect"
-
-    def run(self):
-        ...
-
-
-class HessianDetectConfig(Config):
+class FrangiDetectConfig(Config):
     """Configurable parameters for StreakFinderTask.
     """
     sigmas = ListField(
@@ -60,9 +62,9 @@ class HessianDetectConfig(Config):
     )
 
 
-class HessianDetectTask(Task):
-    ConfigClass = HessianDetectConfig
-    _DefaultName = "hessianDetect"
+class FrangiDetectTask(Task):
+    ConfigClass = FrangiDetectConfig
+    _DefaultName = "frangiDetect"
 
     def run(self, exposure):
 
@@ -71,48 +73,50 @@ class HessianDetectTask(Task):
         catalog = afwTable.SourceCatalog(table)
 
         masked_image = exposure.getMaskedImage()
-        image = masked_image.image.array.astype(np.float32, copy=False)
+        image = masked_image.image.array.astype(np.float32, copy=True) # All should be copies?
         variance = masked_image.variance.array.astype(np.float32, copy=False)
         mask = masked_image.mask.array
 
         # Variance whitening
-        image /= np.sqrt(np.maximum(variance, 1e-6)
+        image /= np.sqrt(np.maximum(variance, 1e-6))
 
         # Suppress invalid pixels from bad mask planes
         bad_mask_bits = exposure.mask.getPlaneBitMask(self.config.bad_mask_planes)
         invalid = (mask & bad_mask_bits) != 0
-        grown_invalid = binary_dilation(
-            invalid,
-            iterations=max(1, int(np.ceil(2 * self.config.npix_to_dilate))),
-        ) # Can use SpanSet.dilated() and setting a cleared copy of the original mask?
+        grown_invalid = binary_dilation(invalid, iterations=max(1, self.config.npix_to_dilate))
+        image[grown_invalid] = 0.0
 
         vesselness = frangi(
             image,
             sigmas=self.config.sigmas,
-            alpha=self.config.alpha,
+            alpha=0.5,
             beta=self.config.beta,
             gamma=self.config.gamma,
             black_ridges=False,
-        ) # Need all alpha, beta, gamma for 2-d?
+        )
+        vesselness = vesselness.astype(np.float32, copy=False) # set to known dtype
+        vesselness[grown_invalid] = 0.0
 
         # Calculate binary array by thresholding
-        valid = vesselness[~grown_invalid]
-        if valid_ridges.size == 0:
+        valid = vesselness[vesselness > 0.] # alternatively: min_vesselness_floor = 1e-6
+        if valid.size == 0:
             return Struct(
                 streak_catalog=catalog,
                 vesselness=vesselness,
             )
 
         mad = median_abs_deviation(valid, scale="normal")
-        if mad <= 0 or not np.isfinite(mad):
-            mad = np.std(valid_ridges)
+        if mad <= 0 or not np.isfinite(mad): # alternatively: max(mad, self.config.min_mad)
+            mad = np.std(valid)
 
         threshold = np.median(valid) + self.config.threshold_nsig * mad
+        # alternatively: threshold = self.config.threshold_nsig * mad
         binary = vesselness > threshold
-        binary[grown_invalid] = False # needed?
+        binary[grown_invalid] = False
+        binary = remove_small_objects(binary, min_size=self.config.min_area)
 
         # Do simple pixel connectivity to generate an approximate line segment parametrization
-        labels = label(binary, connectivity=2)
+        labels = label(binary, connectivity=2) 
         for region in regionprops(labels):
 
             if region.area < self.config.min_area:
@@ -130,12 +134,10 @@ class HessianDetectTask(Task):
             weights = vesselness[ys, xs]
             line_segment = fit_line_segment_from_xy(xs, ys, weights=weights)
 
-            span_list: list[afwGeom.Span] = []
-            for y in np.unique(ys):
-                x_row = xs[ys == y]
-                span_list.append(afwGeom.Span(int(y), int(x_row.min()), int(x_row.max())))
+            footprint_mask = np.zeros_like(binary, dtype=np.uint8)
+            footprint_mask[ys, xs] = 1
 
-            spans = afwGeom.SpanSet(span_list)
+            spans = afwGeom.SpanSet.fromMask(footprint_mask.astype(np.int32))
             footprint = afwDetect.Footprint(spans)
 
             record = catalog.addNew()

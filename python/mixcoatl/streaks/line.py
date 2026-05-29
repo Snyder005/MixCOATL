@@ -101,7 +101,7 @@ class LineGeometry2D(ABC):
 
         return type(self).from_points(p0_t, p1_t)
 
-   def rotated(self, angle: geom.Angle) -> Self:
+    def rotated(self, angle: geom.Angle) -> Self:
         """Apply a rotational transformation.
 
         Parameters
@@ -384,7 +384,7 @@ class LineSegment2D(LineGeometry2D):
         self,
         box: geom.Box2I | geom.Box2D,
         atol: float = 1e-12,
-    ) -> list[geom.Point2D]
+    ) -> list[geom.Point2D]:
 
         return [
             p for p in self.line.intersections_with_box_edges(box, atol=atol) if self.contains(p, atol=atol)
