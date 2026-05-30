@@ -10,6 +10,12 @@ from numpy.typing import ArrayLike, NDArray
 
 import lsst.geom as geom
 
+@dataclass
+class LineFitResult:
+    line_segment: LineSegment2D
+    rms: float
+    width: float
+    aspect_ratio: float
 
 class LineGeometry2D(ABC):
     """Abstract base class for transformable line geometries."""
@@ -320,7 +326,7 @@ class LineSegment2D(LineGeometry2D):
     @classmethod    
     def from_center_length(cls, line: Line2D, u_center: float, length: float) -> Self:
         h = 0.5 * length
-        interval = geom.IntervalD.fromSpannedPoints((center - h, center + h))
+        interval = geom.IntervalD.fromSpannedPoints((u_center - h, u_center + h))
         return cls(line, interval)
 
     @classmethod
@@ -491,10 +497,21 @@ def fit_line_segment_from_xy(x: ArrayLike, y: ArrayLike, weights: ArrayLike | No
     theta = math.atan2(normal[1], normal[0])
     line = Line2D(rho, theta * geom.radians)
 
+    distances = np.array([line.signed_distance(geom.Point2D(px, py)) for px, py in zip(x, y, strict=True)])
     projections = [line.project(geom.Point2D(px, py)) for px, py in zip(x, y, strict=True)]
     interval = geom.IntervalD.fromSpannedPoints(projections)
 
-    return LineSegment2D(line=line, interval=interval) 
+    line_segment = LineSegment2D(line=line, interval=interval)
+    rms = np.sqrt(np.average(np.array(distances)**2, weights=w))
+    width = 2.355 * rms
+    aspect_ratio = line_segment.length / width
+
+    return LineFitResult(
+        line_segment=line_segment,
+        rms=rms,
+        width=width,
+        aspect_ratio=aspect_ratio,
+    )
 
 
 def _apply_transform(transform: Any, point: geom.Point2D) -> geom.Point2D:
@@ -570,7 +587,7 @@ def _dot(v0: geom.Extent2D, v1: geom.Extent2D) -> float:
     dot_product : `float`
         The dot product of the two vectors.
     """
-    return v1.x * v2.x + v1.y * v2.y
+    return v0.x * v1.x + v0.y * v1.y
 
 
 def _line_box_interval(line: Line2D, box: geom.Box2D | geom.Box2I) -> geom.IntervalD | None:

@@ -1,12 +1,8 @@
-# Notes for testing:
-#   * Need to avoid modifying exposure arrays in-place
-#   * May need to adjust the label connectivity for unbinned image
 # Notes for optimization:
-#   * MAD may become extremely small on empty fields or low-background diffims
-#   * A minimal vesselness value may be needed to remove small Frangi responses
+#   * MAD may become extremely small on empty fields or diffims
 #   * Could add an adaptive gamma based off of percentile
-#   * Filtering of regions may be better using estimated theta mean/std for all points
-
+#   * Filtering of regions may be better using estimated fit RMS/aspect ratio
+#   * Computing bottleneck is the Hessian matrix per sigma due to image size
 import numpy as np
 from scipy.ndimage import binary_dilation
 from scipy.stats import median_abs_deviation
@@ -38,13 +34,17 @@ class FrangiDetectConfig(Config):
     gamma = Field(
         doc="Frangi correction constant to adjust sensitivity to structural strength.",
         dtype=float,
-        default=2.0,
+        default=3.0,
     )
     npix_to_dilate = Field(
         doc="Number of pixels to dilate the bad mask planes.",
         dtype=int,
-        default=4,
+        default=8,
     )
+    threshold_nsig = Field(
+        doc="Number of sigma for vesselness thresholding.",
+        dtype=float,
+        default=5.0
     eccentricity = Field(
         doc="Lower bound for the eccentricity of the the minima regions.",
         dtype=float,
@@ -53,12 +53,12 @@ class FrangiDetectConfig(Config):
     min_area = Field(
         doc="Mininum pixel area of minima regions.",
         dtype=int,
-        default=64,
+        default=81,
     )
     bad_mask_planes = ListField(
         doc="Names of mask plane regions to ignore when doing streak detection.",
         dtype=str,
-        default=("NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"),
+        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"],
     )
 
 
@@ -69,12 +69,24 @@ class FrangiDetectTask(Task):
     def run(self, exposure):
 
         schema = StreakSchema.makeMinimalSchema()
+
+        schema.addField(
+            "line_rms",
+            type=np.float32,
+            doc="Weighted perpendicular RMS residual from line fit.",
+        )
+        schema.addField(
+            "aspect_ratio",
+            type=np.float32,
+            doc="Length divided by estimated width.",
+        )
+
         table = afwTable.SourceTable.make(schema)
         catalog = afwTable.SourceCatalog(table)
 
         masked_image = exposure.getMaskedImage()
-        image = masked_image.image.array.astype(np.float32, copy=True) # All should be copies?
-        variance = masked_image.variance.array.astype(np.float32, copy=False)
+        image = masked_image.image.array.astype(np.float32, copy=True)
+        variance = masked_image.variance.array.astype(np.float32, copy=True)
         mask = masked_image.mask.array
 
         # Variance whitening
@@ -94,11 +106,10 @@ class FrangiDetectTask(Task):
             gamma=self.config.gamma,
             black_ridges=False,
         )
-        vesselness = vesselness.astype(np.float32, copy=False) # set to known dtype
         vesselness[grown_invalid] = 0.0
 
         # Calculate binary array by thresholding
-        valid = vesselness[vesselness > 0.] # alternatively: min_vesselness_floor = 1e-6
+        valid = vesselness[vesselness > 1e-6] # alternatively: min_vesselness_floor
         if valid.size == 0:
             return Struct(
                 streak_catalog=catalog,
@@ -110,10 +121,9 @@ class FrangiDetectTask(Task):
             mad = np.std(valid)
 
         threshold = np.median(valid) + self.config.threshold_nsig * mad
-        # alternatively: threshold = self.config.threshold_nsig * mad
         binary = vesselness > threshold
         binary[grown_invalid] = False
-        binary = remove_small_objects(binary, min_size=self.config.min_area)
+        binary = remove_small_objects(binary, max_size=self.config.min_area)
 
         # Do simple pixel connectivity to generate an approximate line segment parametrization
         labels = label(binary, connectivity=2) 
@@ -122,7 +132,7 @@ class FrangiDetectTask(Task):
             if region.area < self.config.min_area:
                 continue
 
-            if region.eccentricity < self.config.eccentricity: # Better quantity to use (theta mean/std)
+            if region.eccentricity < self.config.eccentricity:
                 continue
 
             coords = region.coords
@@ -132,7 +142,7 @@ class FrangiDetectTask(Task):
                 continue
 
             weights = vesselness[ys, xs]
-            line_segment = fit_line_segment_from_xy(xs, ys, weights=weights)
+            fit_result = fit_line_segment_from_xy(xs, ys, weights=weights)
 
             footprint_mask = np.zeros_like(binary, dtype=np.uint8)
             footprint_mask[ys, xs] = 1
@@ -142,15 +152,11 @@ class FrangiDetectTask(Task):
 
             record = catalog.addNew()
             streak = StreakAdapter(record)
-            streak.line_segment = line_segment
+            streak.line_segment = fit_result.line_segment
             streak["detector"] = exposure.detector.getId()
-            streak.footprint = footprint # may change API to setFootprint to match SourceRecord
-
-            # May propogate in future (but can be calculated from Footprint)
-            #streak["theta_mean"] = theta # calculated from Ixx, Iyy, Ixy of hessian matrix at fp center
-            #streak["theta_std"] = 0.0
-            #streak["ridge_strength"] = np.median(weights) # ridge strength
-            #streak["ridge_width"] = 2.355 * orientation_sigma # ridge width estimate
+            streak["line_rms"] = fit_result.rms
+            streak["aspect_ratio"] = fit_result.aspect_ratio
+            streak.footprint = footprint
 
         return Struct(
             streak_catalog=catalog,
