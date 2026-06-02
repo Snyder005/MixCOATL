@@ -4,18 +4,52 @@
 #   * Filtering of regions may be better using estimated fit RMS/aspect ratio
 #   * Computing bottleneck is the Hessian matrix per sigma due to image size
 import numpy as np
+from numpy.typing import NDArray
 from scipy.ndimage import binary_dilation
 from scipy.stats import median_abs_deviation
 from skimage.filters import frangi
+from skimage.measure import label, regionprops
 from skimage.morphology import remove_small_objects
 
 import lsst.afw.detection as afwDetect
 import lsst.afw.geom as afwGeom
+import lsst.afw.image as afwImage
 import lsst.afw.table as afwTable
 from lsst.pex.config import Config, Field, ListField
 from lsst.pipe.base import Struct, Task
 from mixcoatl.streaks.line import fit_line_segment_from_xy
 from mixcoatl.streaks.table import StreakAdapter, StreakSchema
+
+
+def get_bad_pixel_mask(
+    exposure: afwImage.ExposureF,
+    bad_mask_planes: list[str],
+    npix_to_dilate: int = 8,
+) -> NDArray[np.bool]:
+    """Get a bad pixel mask."""
+    bad_mask_bits = exposure.mask.getPlaneBitMask(bad_mask_planes)
+    bad = (exposure.mask.array & bad_mask_bits) != 0
+    bad = binary_dilation(bad, iterations=max(1, npix_to_dilate))
+    
+    return bad
+
+
+def get_robust_threshold(
+    likelihood: NDArray[np.float32],
+    min_likelihood: float = 1e-6,
+    nsig: float = 5.0,
+) -> float:
+    """Calculate a robust threshold for the likelhood array."""
+    valid = likelihood[likelihood > min_likelihood]
+    if valid.size == 0:
+        raise ValueError("no valid points in the likelihood map")
+
+    mad = median_abs_deviation(valid, scale="normal")
+    if mad <= 0 or not np.isfinite(mad): # alternatively: max(mad, min_mad)
+        mad = np.std(valid)
+
+    threshold = np.median(valid) + nsig * mad
+    return threshold
 
 
 class FrangiDetectConfig(Config):
@@ -44,7 +78,13 @@ class FrangiDetectConfig(Config):
     threshold_nsig = Field(
         doc="Number of sigma for vesselness thresholding.",
         dtype=float,
-        default=5.0
+        default=5.0,
+    )
+    min_vesselness = Field(
+        doc="Minimum vesselness for threshold calculation.",
+        dtype=float,
+        default=1e-6,
+    )
     eccentricity = Field(
         doc="Lower bound for the eccentricity of the the minima regions.",
         dtype=float,
@@ -68,8 +108,8 @@ class FrangiDetectTask(Task):
 
     def run(self, exposure):
 
+        # Create a streak catalog
         schema = StreakSchema.makeMinimalSchema()
-
         schema.addField(
             "line_rms",
             type=np.float32,
@@ -80,74 +120,58 @@ class FrangiDetectTask(Task):
             type=np.float32,
             doc="Length divided by estimated width.",
         )
-
         table = afwTable.SourceTable.make(schema)
         catalog = afwTable.SourceCatalog(table)
 
-        masked_image = exposure.getMaskedImage()
-        image = masked_image.image.array.astype(np.float32, copy=True)
-        variance = masked_image.variance.array.astype(np.float32, copy=True)
-        mask = masked_image.mask.array
-
         # Variance whitening
-        image /= np.sqrt(np.maximum(variance, 1e-6))
+        weighted_image = exposure.image.array / np.sqrt(np.maximum(exposure.variance.array, 1e-6))
 
         # Suppress invalid pixels from bad mask planes
-        bad_mask_bits = exposure.mask.getPlaneBitMask(self.config.bad_mask_planes)
-        invalid = (mask & bad_mask_bits) != 0
-        grown_invalid = binary_dilation(invalid, iterations=max(1, self.config.npix_to_dilate))
-        image[grown_invalid] = 0.0
+        invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
+        weighted_image[invalid] = 0.0 # Needed if masking further downstream?
 
         vesselness = frangi(
-            image,
+            weighted_image,
             sigmas=self.config.sigmas,
             alpha=0.5,
             beta=self.config.beta,
             gamma=self.config.gamma,
             black_ridges=False,
         )
-        vesselness[grown_invalid] = 0.0
+        vesselness[invalid] = 0.0  # Needed to mask bad regions (grown to remove mask edge effects)
 
         # Calculate binary array by thresholding
-        valid = vesselness[vesselness > 1e-6] # alternatively: min_vesselness_floor
-        if valid.size == 0:
-            return Struct(
-                streak_catalog=catalog,
-                vesselness=vesselness,
+        try:
+            threshold = get_robust_threshold(
+                vesselness,
+                self.config.min_vesselness,
+                self.config.threshold_nsig,
             )
+        except:
+            return Struct(streak_catalog=streak_catalog, vesselness=vesselness)
 
-        mad = median_abs_deviation(valid, scale="normal")
-        if mad <= 0 or not np.isfinite(mad): # alternatively: max(mad, self.config.min_mad)
-            mad = np.std(valid)
-
-        threshold = np.median(valid) + self.config.threshold_nsig * mad
         binary = vesselness > threshold
-        binary[grown_invalid] = False
+        binary[invalid] = False  # Needed again? shouldn't these all be 0 from before?
         binary = remove_small_objects(binary, max_size=self.config.min_area)
 
         # Do simple pixel connectivity to generate an approximate line segment parametrization
         labels = label(binary, connectivity=2) 
         for region in regionprops(labels):
-
-            if region.area < self.config.min_area:
-                continue
-
             if region.eccentricity < self.config.eccentricity:
                 continue
 
             coords = region.coords
             ys = coords[:, 0]
             xs = coords[:, 1]
-            if np.any(grown_invalid[ys, xs]):
+            if np.any(invalid[ys, xs]):  # Another check?
                 continue
 
             weights = vesselness[ys, xs]
             fit_result = fit_line_segment_from_xy(xs, ys, weights=weights)
 
-            footprint_mask = np.zeros_like(binary, dtype=np.uint8)
-            footprint_mask[ys, xs] = 1
-
-            spans = afwGeom.SpanSet.fromMask(footprint_mask.astype(np.int32))
+            footprint_mask = afwImage.MaskX(np.zeros_like(binary, dtype=np.int32))
+            footprint_mask.array[ys, xs] = 1
+            spans = afwGeom.SpanSet.fromMask(footprint_mask)
             footprint = afwDetect.Footprint(spans)
 
             record = catalog.addNew()
@@ -158,7 +182,4 @@ class FrangiDetectTask(Task):
             streak["aspect_ratio"] = fit_result.aspect_ratio
             streak.footprint = footprint
 
-        return Struct(
-            streak_catalog=catalog,
-            vesselness=vesselness,
-        )
+        return Struct(streak_catalog=catalog, vesselness=vesselness)
