@@ -16,21 +16,23 @@ class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument
     detected_lines = Output(
         doc="Lines detected in the input exposure.",
         name="detected_lines",
-        storageClass="ArrowAstropy",
+        storageClass="ArrowAstropy",  # what storageClass?
         dimensions=("instrument", "visit", "detector"),
     )
 
-    # hessian exclusive outputs
+    # Frangi exclusive outputs
+    vesselness = Output(
+        doc="Frangi vesselness image.",
+        name="vesselness",
+        storageClass="Image",
+        dimensions=("instrument", "visit", "detector"),
+    )
+
+    # Hessian exclusive outputs
     minima_ridges = Output(
         doc="Hessian matrix minima ridges image.",
         name="minima_ridges",
         storageClass="Image",
-        dimensions=("instrument", "visit", "detector"),
-    )
-    binary_ridges = Output(
-        doc="Detected ridges image.",
-        name="binary_ridges",
-        storageClass="Mask",
         dimensions=("instrument", "visit", "detector"),
     )
 
@@ -38,7 +40,8 @@ class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument
         super().__init__(config=config)
         if config.detection_algorithm != "hessian":
             del self.minima_ridges
-            del self.binary_ridges
+        if config.detection_algorithm !- "frangi":
+            del self.vesselness
 
 
 class StreakAnalysisConfig(PipelineTaskConfig, pipelineConnections=StreakAnalysisConnections):
@@ -46,11 +49,20 @@ class StreakAnalysisConfig(PipelineTaskConfig, pipelineConnections=StreakAnalysi
         dtype=str,
         default="hessian",
         doc="Line detection algorithm to use.",
-        allowed={"hessian": "Hessian matrix."},
+        allowed={
+            "hessian": "Hessian matrix.",
+            "frangi" : "Multiscale Frangi vesselness.",
+            "kht" : "Kernel Hough transform.",
+            "radon" : "Matched filter Radon transform.",
+        },
     )
-    detect_streaks = ConfigurableField(
+    frangi_detect = ConfigurableField(
+        target=FrangiDetectTask,
+        doc="Detect streaks using multiscale Frangi vesselness.",
+    )
+    hessian_detect = ConfigurableField(
         target=HessianDetectTask,
-        doc="Detect streaks using Hessian matrix line detection.",
+        doc="Detect streaks using Hessian matrix.",
     )
 
 
@@ -65,22 +77,16 @@ class StreakAnalysisTask(PipelineTask):
 
     def run(self, exposure):
 
-        result = Struct(detected_lines=None, minima_ridges=None, binary_ridges=None)
-
         if self.config.detection_algorithm == "hessian":
-            detect_streak_result = self.detect_streaks.run(exposure)
-            lines = detect_streak_result.lines
-            result.minima_ridges = ImageF(detect_streak_result.minima_ridges.astype(np.float32))
-            result.binary_ridges = MaskX(detcted_streak_result.binary_ridges.astype(np.int32))
+            detect_result = self.hessian_detect.run(exposure)
+            return Struct(
+                streak_catalog=streak_catalog,
+                minima_ridges=ImageF(detect_result.minima_ridges.astype(np.float32)),
+            )
 
-        catalog = makeStreakCatalog()
-        detector_id = exposure.getDetector().getId()
-        for line in lines:
-            rec = catalog.addNew()
-            rec["detector"] = detector_id
-            rec["line_rho"] = line.rho
-            rec["line_theta"] = line.theta
-
-        result.detected_lines = catalog
-
-        return result
+        elif self.config.detection_algorithm == "frangi":
+            detect_result = self.frangi_detect.run(exposure)
+            return Struct(
+                streak_catalog=streak_catalog,
+                vesselness=ImageF(detect_result.vesselness.astype(np.float32)),
+            )
