@@ -11,10 +11,10 @@ from skimage.filters import frangi
 from skimage.measure import label, regionprops
 from skimage.morphology import remove_small_objects
 
-import lsst.afw.detection as afwDetect
-import lsst.afw.geom as afwGeom
-import lsst.afw.image as afwImage
-import lsst.afw.table as afwTable
+from lsst.afw.detection import Footprint
+from lsst.afw.geom import SpanSet
+from lsst.afw.image import ExposureF, MaskX
+from lsst.afw.table import SourceCatalog, SourceTable
 from lsst.pex.config import Config, Field, ListField
 from lsst.pipe.base import Struct, Task
 from mixcoatl.streaks.line import fit_line_segment_from_xy
@@ -22,7 +22,7 @@ from mixcoatl.streaks.table import StreakAdapter, StreakSchema
 
 
 def get_bad_pixel_mask(
-    exposure: afwImage.ExposureF,
+    exposure: ExposureF,
     bad_mask_planes: list[str],
     npix_to_dilate: int = 8,
 ) -> NDArray[np.bool]:
@@ -106,7 +106,7 @@ class FrangiDetectTask(Task):
     ConfigClass = FrangiDetectConfig
     _DefaultName = "frangiDetect"
 
-    def run(self, exposure):
+    def run(self, exposure: ExposureF) -> Struct:
 
         # Create a streak catalog
         schema = StreakSchema.makeMinimalSchema()
@@ -120,15 +120,15 @@ class FrangiDetectTask(Task):
             type=np.float32,
             doc="Length divided by estimated width.",
         )
-        table = afwTable.SourceTable.make(schema)
-        catalog = afwTable.SourceCatalog(table)
+        table = SourceTable.make(schema)
+        catalog = SourceCatalog(table)
 
         # Variance whitening
         weighted_image = exposure.image.array / np.sqrt(np.maximum(exposure.variance.array, 1e-6))
 
         # Suppress invalid pixels from bad mask planes
         invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
-        weighted_image[invalid] = 0.0 # Needed if masking further downstream?
+        weighted_image[invalid] = 0.0
 
         vesselness = frangi(
             weighted_image,
@@ -138,7 +138,7 @@ class FrangiDetectTask(Task):
             gamma=self.config.gamma,
             black_ridges=False,
         )
-        vesselness[invalid] = 0.0  # Needed to mask bad regions (grown to remove mask edge effects)
+        vesselness[invalid] = 0.0
 
         # Calculate binary array by thresholding
         try:
@@ -151,7 +151,7 @@ class FrangiDetectTask(Task):
             return Struct(streak_catalog=streak_catalog, vesselness=vesselness)
 
         binary = vesselness > threshold
-        binary[invalid] = False  # Needed again? shouldn't these all be 0 from before?
+        binary[invalid] = False  # Future proof if threshold logic changes
         binary = remove_small_objects(binary, max_size=self.config.min_area)
 
         # Do simple pixel connectivity to generate an approximate line segment parametrization
@@ -163,16 +163,13 @@ class FrangiDetectTask(Task):
             coords = region.coords
             ys = coords[:, 0]
             xs = coords[:, 1]
-            if np.any(invalid[ys, xs]):  # Another check?
-                continue
-
             weights = vesselness[ys, xs]
             fit_result = fit_line_segment_from_xy(xs, ys, weights=weights)
 
-            footprint_mask = afwImage.MaskX(np.zeros_like(binary, dtype=np.int32))
+            footprint_mask = MaskX(np.zeros_like(binary, dtype=np.int32))
             footprint_mask.array[ys, xs] = 1
-            spans = afwGeom.SpanSet.fromMask(footprint_mask)
-            footprint = afwDetect.Footprint(spans)
+            spans = SpanSet.fromMask(footprint_mask)
+            footprint = Footprint(spans)
 
             record = catalog.addNew()
             streak = StreakAdapter(record)
