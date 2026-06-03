@@ -19,6 +19,10 @@ class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument
         storageClass="ArrowAstropy",  # what storageClass?
         dimensions=("instrument", "visit", "detector"),
     )
+    detected = Output(
+        doc="detected",
+        storageClass="Mask",
+        dimensions
 
     # Frangi exclusive outputs
     vesselness = Output(
@@ -47,7 +51,7 @@ class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument
 class StreakAnalysisConfig(PipelineTaskConfig, pipelineConnections=StreakAnalysisConnections):
     detection_algorithm = ChoiceField(
         dtype=str,
-        default="hessian",
+        default="frangi",
         doc="Line detection algorithm to use.",
         allowed={
             "hessian": "Hessian matrix.",
@@ -64,6 +68,10 @@ class StreakAnalysisConfig(PipelineTaskConfig, pipelineConnections=StreakAnalysi
         target=HessianDetectTask,
         doc="Detect streaks using Hessian matrix.",
     )
+    kht_detect = ConfigurableField(
+        target=KHTDetectTask,
+        doc="Detect streaks using kernel Hough transform.",
+    )
 
 
 class StreakAnalysisTask(PipelineTask):
@@ -79,14 +87,11 @@ class StreakAnalysisTask(PipelineTask):
 
         if self.config.detection_algorithm == "hessian":
             detect_result = self.hessian_detect.run(exposure)
-            return Struct(
-                streak_catalog=streak_catalog,
-                minima_ridges=ImageF(detect_result.minima_ridges.astype(np.float32)),
-            )
-
         elif self.config.detection_algorithm == "frangi":
             detect_result = self.frangi_detect.run(exposure)
-            return Struct(
-                streak_catalog=streak_catalog,
-                vesselness=ImageF(detect_result.vesselness.astype(np.float32)),
-            )
+        elif self.config.detection_algorithm == "kht":
+            detect_results = self.kht_detect.run(exposure)
+        elif self.config.detection_algorithm == "radon":
+            raise NotImplementedError("radon detection not implemented")
+
+        return Struct(streak_catalog=streak_catalog)

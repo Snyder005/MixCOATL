@@ -11,15 +11,17 @@ from skimage.feature import canny, hessian_matrix, hessian_matrix_eigvals
 from skimage.filters import frangi  # For Frangi
 from skimage.measure import label, regionprops
 from skimage.morphology import remove_small_objects
+from sklearn.cluster import KMeans
 
 import lsst.kht
+import lsst.geom as geom
 from lsst.afw.detection import Footprint
 from lsst.afw.geom import SpanSet
 from lsst.afw.image import ExposureF, MaskX
 from lsst.afw.table import SourceCatalog, SourceTable
 from lsst.pex.config import Config, Field, ListField
 from lsst.pipe.base import Struct, Task
-from mixcoatl.streaks.line import fit_line_segment_from_xy
+from mixcoatl.streaks.line import fit_line_segment_from_xy, Line2D
 from mixcoatl.streaks.table import StreakAdapter, StreakSchema
 
 
@@ -39,15 +41,20 @@ def get_bad_pixel_mask(
 def calculate_response_significance(
     response: NDArray[np.float32],
     invalid: NDArray[np.bool],
+    min_response: float | None = None,
 ) -> tuple[NDArray[np.float32], float, float]:
 
-    valid = response[np.isfinite(response) & ~invalid]
+    valid = np.isfinite(response) & ~invalid
+    if min_response is not None:
+        valid &= (response > min_response)
 
-    if valid.size == 0:
+    responses = response[valid]
+
+    if responses.size == 0:
         raise ValueError("no valid points in the streak detector response")
 
-    median = np.median(valid)
-    sigma = median_abs_deviation(valid, scale="normal")
+    median = np.median(responses)
+    sigma = median_abs_deviation(responses, scale="normal")
     if sigma <= 0 or not np.isfinite(sigma):
         sigma = np.std(valid)
 
@@ -64,7 +71,7 @@ class FrangiDetectConfig(Config):
     bad_mask_planes = ListField(
         doc="Names of mask plane regions to ignore when doing streak detection.",
         dtype=str,
-        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"],
+        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP", "SPIKE"],
     )
     npix_to_dilate = Field(
         doc="Number of pixels to dilate the bad mask planes.",
@@ -154,8 +161,12 @@ class FrangiDetectTask(Task):
         vesselness[invalid] = 0.0
 
         # Calculate background-normalized significance
-        significance, median, sigma = calculate_response_significance(vesselness, invalid)
-        binary = (significance > self.config.response_nsig) & (vesselness > self.config.min_vesselness)
+        significance, median, sigma = calculate_response_significance(
+            vesselness,
+            invalid,
+            min_response=self.config.min_vesselness,
+        )
+        binary = (significance > self.config.response_nsig)
         binary[invalid] = False
 
         # Connect pixel regions and add to catalog
@@ -210,14 +221,14 @@ class HessianDetectConfig(Config):
     sigma = Field(
         doc="Gaussian scale for Hessian matrix.",
         dtype=float,
-        default=2.0,
+        default=1.0,
     )
 
     # Configruation for response thresholding
     response_nsig = Field(
         doc="Number of sigma for thresholding of the streak detector response.",
         dtype=float,
-        default=4.0,
+        default=5.0,
     )
 
     # Configuration for detected regions
@@ -275,7 +286,7 @@ class HessianDetectTask(Task):
         )
         h_elems = [self.config.sigma**2 * h for h in h_elems]
         maxima_ridges, minima_ridges = hessian_matrix_eigvals(h_elems)
-        response = ~minima_ridges
+        response = -minima_ridges
         response[invalid] = 0.0
 
         # Calculate background-normalized significance
@@ -336,7 +347,7 @@ class KHTDetectConfig(Config):
     bad_mask_planes = ListField(
         doc="Names of mask plane regions to ignore when doing streak detection.",
         dtype=str,
-        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"],
+        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP", "SPIKE"],
     )
     npix_to_dilate = Field(
         doc="Number of pixels to dilate the bad mask planes.",
@@ -345,10 +356,48 @@ class KHTDetectConfig(Config):
     )
 
     # Configuration for Kernel Hough transform
+    cluster_minimum_size = Field(
+        doc="Minimum size (in pixels) of detected clusters.",
+        dtype=int,
+        default=50,
+    )
+    cluster_minimum_deviation = Field(
+        doc="Allowed deviation (in pixels) from a straight line for a detected line.",
+        dtype=int,
+        default=2,
+    )
+    delta = Field(
+        doc="Stepsize in angle-radius parameter space.",
+        dtype=float,
+        default=0.2,
+    )
+    minimum_kernel_height = Field(
+        doc="Minimum height of the streak-finding kernel relative to the tallest kernel.",
+        dtype=float,
+        default=0.0,
+    )
+    nsigma = Field(
+        doc="Number of sigma from center of kernel to include in voting procedure.",
+        dtype=float,
+        default=2.0,
+    )
+    abs_minimum_kernel_height = Field(
+        doc="Minimum absolute height of the streak-finding kernel.",
+        dtype=float,
+        default=5.0,
+    )
 
-    # Configuration for response thresholding
-
-    # Configuration for detected regions
+    # Configuration for clustering
+    rho_bin_size = Field(
+        doc="Binsize (in pixels) for position parameter when finding clusters of detected lines.",
+        dtype=float,
+        default=40.0,
+    )
+    theta_bin_size = Field(
+        doc="Binsize (in degrees) for angle parameter theta when finding clusters of detected lines.",
+        dtype=float,
+        default=2.0,
+    )
 
 
 class KHTDetectTask(Task):
@@ -359,8 +408,8 @@ class KHTDetectTask(Task):
 
         # Create a streak catalog
         schema = StreakSchema.makeMinimalSchema()
-        table = afwTable.SourceTable.make(schema)
-        catalog = afwTable.SourceCatalog(table)
+        table = SourceTable.make(schema)
+        catalog = SourceCatalog(table)
         
         # Calculate weighted image
         detected = exposure.mask.getPlaneBitMask(self.config.detected_mask_plane)
@@ -368,13 +417,12 @@ class KHTDetectTask(Task):
 
         # Suppress invalid pixels from bad mask planes
         invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
-        weighted_image[invalid] = 0.0
 
         # Calculate Canny edge response
         edges = canny(weighted_image.astype(np.float64), use_quantiles=True, sigma=0.1)
         edges[invalid] = False
 
-
+        # Detect and cluster lines
         lines = lsst.kht.find_lines(
             edges,
             self.config.cluster_minimum_size,
@@ -384,41 +432,50 @@ class KHTDetectTask(Task):
             self.config.nsigma,
             self.config.abs_minimum_kernel_height,
         )
-
-        rhos = lines.rhos
-        theta = lines.thetas
+        rhos, thetas = self._cluster_lines(lines.rho, lines.theta)
 
         box = exposure.detector.getBBox()
-        shift = geom.Extent2D(-box.x, -box.y)
+        shift = box.getCenter().asExtent()
 
-        # Cluster lines
-        x = rhos / self.config.rho_bin_size
-        y = thetas / self.config.theta_bin_size
-        points = np.array([x, y]).T
-        n_clusters = 1
-
-        while True:
-            kmeans = KMeans(n_clusters=n_clusters, n_init="auto").fit(points)
-            cluster_standard_deviations = np.zeros((n_clusters, 2))
-            for c in range(n_clusters):
-                in_cluster = points[kmeans.labels_ == c]
-                cluster_standard_deviations[c] = np.std(in_cluster, axis=0)
-            if (cluster_standard_deviations <= 1).all():
-                break
-            
-            n_clusters += 1
-
-        final_clusters = kmeans.cluster_centers_.T
-        final_rhos = final_clusters[0] * self.config.rho_bin_size
-        final_thetas = final_clusters[1] * self.config.theta_bin_size
-        
-        for rho, theta in np.nditer(final_rhos, final_thetas):
-
-            kht_line = Line2D(rho=line.rho, theta=line.theta * geom.degrees)
+        for rho, theta in np.nditer((rhos, thetas)):
+            kht_line = Line2D(rho, theta * geom.degrees)
             det_line = kht_line.translated(shift)
             
             record = catalog.addNew()
             streak = StreakAdapter(record)
             streak.line_segment = det_line.intersection(box)
 
-        return Struct(streak_catalog=catalog, edges=edges)
+        return Struct(
+            streak_catalog=catalog,
+            detected=edges,
+        )
+
+    def _cluster_lines(
+        self,
+        rhos: NDArray[np.float64],
+        thetas: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Cluster lines by recursive kmeans clustering."""
+        x = rhos / self.config.rho_bin_size
+        y = thetas / self.config.theta_bin_size
+        points = np.column_stack((x, y))
+        
+        n_clusters = 1
+        while True:
+            kmeans = KMeans(n_clusters=n_clusters, n_init="auto").fit(points)
+            cluster_standard_deviations = np.zeros((n_clusters, 2))
+            for c in range(n_clusters):
+                in_cluster = points[kmeans.labels_ == c]
+                cluster_standard_deviations[c] = np.std(in_cluster, axis=0)
+                
+            if (cluster_standard_deviations <= 1).all():
+                break
+                
+            n_clusters += 1
+        
+        final_clusters = kmeans.cluster_centers_.T
+        
+        final_rhos = final_clusters[0] * self.config.rho_bin_size
+        final_thetas = final_clusters[1] * self.config.theta_bin_size
+
+        return final_rhos, final_thetas

@@ -10,6 +10,7 @@ from numpy.typing import ArrayLike, NDArray
 
 import lsst.geom as geom
 
+
 @dataclass
 class LineFitResult:
     """The results of a line segment fit from x/y points.
@@ -254,7 +255,7 @@ class LineGeometry2D(ABC):
         transformed : `mixcoatl.streaks.line.LineGeometry2D`
             The transformed line geometry.
         """
-        return self.transformed(geom.AffineTransform.makeTranslation(translation))
+        return self.transformed(geom.AffineTransform.makeTranslation(offset))
 
 
 
@@ -529,11 +530,11 @@ class LineSegment2D(LineGeometry2D):
 
 
 def embed_rho_theta(
-        rho: ArrayLike,
-        theta: ArrayLike,
-        rho_tol: float,
-        theta_tol: float,
-    ) -> NDArray[np.float64]:
+    rho: ArrayLike,
+    theta: ArrayLike,
+    rho_tol: float,
+    theta_tol: float,
+) -> NDArray[np.float64]:
     """Embed in euclidean space."""
     if rho_tol <= 0:
         raise ValueError(f"rho_tol must be > 0: {rho_tol}")
