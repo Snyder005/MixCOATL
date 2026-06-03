@@ -36,27 +36,43 @@ def get_bad_pixel_mask(
     return bad
 
 
-def get_robust_threshold(
-    likelihood: NDArray[np.float32],
-    min_likelihood: float = 1e-6,
-    nsig: float = 5.0,
-) -> float:
-    """Calculate a robust threshold for the likelhood array."""
-    valid = likelihood[likelihood > min_likelihood]
+def calculate_response_significance(
+    response: NDArray[np.float32],
+    invalid: NDArray[np.bool],
+) -> tuple[NDArray[np.float32], float, float]:
+
+    valid = response[np.isfinite(response) & ~invalid]
+
     if valid.size == 0:
-        raise ValueError("no valid points in the likelihood map")
+        raise ValueError("no valid points in the streak detector response")
 
-    mad = median_abs_deviation(valid, scale="normal")
-    if mad <= 0 or not np.isfinite(mad): # alternatively: max(mad, min_mad)
-        mad = np.std(valid)
+    median = np.median(valid)
+    sigma = median_abs_deviation(valid, scale="normal")
+    if sigma <= 0 or not np.isfinite(sigma):
+        sigma = np.std(valid)
 
-    threshold = np.median(valid) + nsig * mad
-    return threshold
+    if sigma <= 0 or not np.isfinite(sigma):
+        raise ValueError("streak detector response has no measurable dispersion")
+
+    significance = (response - median) / sigma
+    return significance, median, sigma
 
 
 class FrangiDetectConfig(Config):
-    """Configurable parameters for `FrangiDetectTask`.
-    """
+    """Configurable parameters for `FrangiDetectTask`."""
+    # Configuration for masking
+    bad_mask_planes = ListField(
+        doc="Names of mask plane regions to ignore when doing streak detection.",
+        dtype=str,
+        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"],
+    )
+    npix_to_dilate = Field(
+        doc="Number of pixels to dilate the bad mask planes.",
+        dtype=int,
+        default=8,
+    )
+
+    # Configuration for Frangi filter
     sigmas = ListField(
         doc="Gaussian scale for multiscale Hessian matrix.",
         dtype=float,
@@ -72,13 +88,10 @@ class FrangiDetectConfig(Config):
         dtype=float,
         default=3.0,
     )
-    npix_to_dilate = Field(
-        doc="Number of pixels to dilate the bad mask planes.",
-        dtype=int,
-        default=8,
-    )
-    threshold_nsig = Field(
-        doc="Number of sigma for vesselness thresholding.",
+
+    # Configuration for response thresholding
+    response_nsig = Field(
+        doc="Number of sigma for streak detector response thresholding.",
         dtype=float,
         default=5.0,
     )
@@ -87,20 +100,17 @@ class FrangiDetectConfig(Config):
         dtype=float,
         default=1e-6,
     )
+
+    # Configuration for detected regions
+    min_area = Field(
+        doc="Mininum pixel area of the detected regions.",
+        dtype=int,
+        default=81,
+    )
     eccentricity = Field(
         doc="Lower bound for the eccentricity of the detected regions.",
         dtype=float,
         default=0.98,
-    )
-    min_area = Field(
-        doc="Mininum pixel area of detected regions.",
-        dtype=int,
-        default=81,
-    )
-    bad_mask_planes = ListField(
-        doc="Names of mask plane regions to ignore when doing streak detection.",
-        dtype=str,
-        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"],
     )
 
 
@@ -125,13 +135,14 @@ class FrangiDetectTask(Task):
         table = SourceTable.make(schema)
         catalog = SourceCatalog(table)
 
-        # Variance whitening
+        # Calculate weighted image
         weighted_image = exposure.image.array / np.sqrt(np.maximum(exposure.variance.array, 1e-6))
 
         # Suppress invalid pixels from bad mask planes
         invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
         weighted_image[invalid] = 0.0
 
+        # Calculate Frangi vesselness
         vesselness = frangi(
             weighted_image,
             sigmas=self.config.sigmas,
@@ -142,21 +153,13 @@ class FrangiDetectTask(Task):
         )
         vesselness[invalid] = 0.0
 
-        # Calculate binary array by thresholding
-        try:
-            threshold = get_robust_threshold(
-                vesselness,
-                self.config.min_vesselness,
-                self.config.threshold_nsig,
-            )
-        except:
-            return Struct(streak_catalog=catalog, vesselness=vesselness)
+        # Calculate background-normalized significance
+        significance, median, sigma = calculate_response_significance(vesselness, invalid)
+        binary = (significance > self.config.response_nsig) & (vesselness > self.config.min_vesselness)
+        binary[invalid] = False
 
-        binary = vesselness > threshold
-        binary[invalid] = False  # Future proof if threshold logic changes
-        detected = remove_small_objects(detected, max_size=self.config.min_area)
-
-        # Do simple pixel connectivity to generate an approximate line segment parametrization
+        # Connect pixel regions and add to catalog
+        detected = remove_small_objects(binary, max_size=self.config.min_area)
         labels = label(detected, connectivity=2)
         for region in regionprops(labels):
             if region.eccentricity < self.config.eccentricity:
@@ -181,33 +184,45 @@ class FrangiDetectTask(Task):
             streak["aspect_ratio"] = fit_result.aspect_ratio
             streak.footprint = footprint
 
-        return Struct(streak_catalog=catalog, vesselness=vesselness, detected=detected)
+        return Struct(
+            streak_catalog=catalog,
+            significance=significance,
+            detected=detected,
+            response=vesselness,
+        )
 
 
 class HessianDetectConfig(Config):
     """Configurable parameters for `HessianDetectClass`."""
+    # Configuration for masking
     bad_mask_planes = ListField(
         doc="Names of mask plane regions to ignore when doing streak detection.",
         dtype=str,
-        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP"],
+        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP", "SPIKE"],
     )
     npix_to_dilate = Field(
         doc="Number of pixels to dilate the bad mask planes.",
         dtype=int,
         default=8,
     )
+
+    # Configuration for Hessian matrix
     sigma = Field(
         doc="Gaussian scale for Hessian matrix.",
         dtype=float,
         default=2.0,
     )
-    threshold_nsig = Field(
-        doc="Number of sigma for Hessian thresholding.",
+
+    # Configruation for response thresholding
+    response_nsig = Field(
+        doc="Number of sigma for thresholding of the streak detector response.",
         dtype=float,
         default=4.0,
     )
+
+    # Configuration for detected regions
     min_area = Field(
-        doc="Minimum pixel area of detected regions.",
+        doc="Minimum pixel area of the detected regions.",
         dtype=int,
         default=81,
     )
@@ -215,6 +230,11 @@ class HessianDetectConfig(Config):
         doc="Lower bound for the eccentricity of the detected regions.",
         dtype=float,
         default=0.98,
+    )
+    aspect_ratio = Field(
+        doc="Lower bound for the aspect ratio of the detected regions.",
+        dtype=float,
+        default=8.0,
     )
 
 
@@ -239,28 +259,32 @@ class HessianDetectTask(Task):
         table = SourceTable.make(schema)
         catalog = SourceCatalog(table)
 
-        # Variance whitening
-#        weighted_image = exposure.image.array / np.sqrt(np.maximum(exposure.variance.array, 1e-6))
-        weighted_image = exposure.image.array.copy()
+        # Calculate weighted image
+        weighted_image = exposure.image.array / np.sqrt(np.maximum(exposure.variance.array, 1e-6))
 
         # Suppress invalid pixels from bad mask planes
         invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
         weighted_image[invalid] = 0.0
 
+        # Calculate Hessian eigenvalues
         h_elems = hessian_matrix(
             weighted_image,
             sigma=self.config.sigma,
             order="rc",
             use_gaussian_derivatives=True,
         )
+        h_elems = [self.config.sigma**2 * h for h in h_elems]
         maxima_ridges, minima_ridges = hessian_matrix_eigvals(h_elems)
-        minima_ridges[invalid] = 0.0
+        response = ~minima_ridges
+        response[invalid] = 0.0
 
-        threshold = np.median(minima_ridges) - self.config.threshold_nsig * np.std(minima_ridges)
-        binary = minima_ridges < threshold
+        # Calculate background-normalized significance
+        significance, median, sigma = calculate_response_significance(response, invalid)
+        binary = significance > self.config.response_nsig
         binary[invalid] = False
-        detected = remove_small_objects(binary, max_size=self.config.min_area)
 
+        # Connect pixel regions and add to catalog
+        detected = remove_small_objects(binary, max_size=self.config.min_area)
         labels = label(detected, connectivity=2)
         for region in regionprops(labels):
             if region.eccentricity < 0.98:
@@ -272,7 +296,10 @@ class HessianDetectTask(Task):
             weights = detected[ys, xs]
             fit_result = fit_line_segment_from_xy(xs, ys, weights=weights)
 
-            if fit_result.aspect_ratio < 8 or not np.isfinite(fit_result.aspect_ratio):
+            if fit_result.aspect_ratio < self.config.aspect_ratio:
+                continue
+            
+            if not np.isfinite(fit_result.aspect_ratio):
                 continue
 
             footprint_mask = MaskX(np.zeros_like(binary, dtype=np.int32))
@@ -290,17 +317,22 @@ class HessianDetectTask(Task):
 
         return Struct(
             streak_catalog=catalog,
-            minima_ridges=minima_ridges,
+            significance=significance,
             detected=detected,
+            response=response,
         )
 
 
 class KHTDetectConfig(Config):
+    """Configurable parameters for `KHTDetectTask`."""
+    # Configuration for masking
     detected_mask_plane = Field(
         doc="Name of mask plane region with pixels above detection threshold.",
         dtype=str,
         default="DETECTED",
     )
+
+    # Configuration for masking
     bad_mask_planes = ListField(
         doc="Names of mask plane regions to ignore when doing streak detection.",
         dtype=str,
@@ -312,6 +344,12 @@ class KHTDetectConfig(Config):
         default=8,
     )
 
+    # Configuration for Kernel Hough transform
+
+    # Configuration for response thresholding
+
+    # Configuration for detected regions
+
 
 class KHTDetectTask(Task):
     ConfigClass = KHTDetectConfig
@@ -319,18 +357,23 @@ class KHTDetectTask(Task):
 
     def run(self, exposure: ExposureF) -> Struct:
 
+        # Create a streak catalog
         schema = StreakSchema.makeMinimalSchema()
         table = afwTable.SourceTable.make(schema)
         catalog = afwTable.SourceCatalog(table)
         
+        # Calculate weighted image
         detected = exposure.mask.getPlaneBitMask(self.config.detected_mask_plane)
         weighted_image = (exposure.mask.array & detected)
 
+        # Suppress invalid pixels from bad mask planes
         invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
-        image[invalid] = 0.0
+        weighted_image[invalid] = 0.0
 
-        init_edges = canny(image.astype(np.float64), use_quantiles=True, sigma=0.1)
-        edges = init_edges & ~invalid  # This equivalent to vesselness or minima_ridges
+        # Calculate Canny edge response
+        edges = canny(weighted_image.astype(np.float64), use_quantiles=True, sigma=0.1)
+        edges[invalid] = False
+
 
         lines = lsst.kht.find_lines(
             edges,
