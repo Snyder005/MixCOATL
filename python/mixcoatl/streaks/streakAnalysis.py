@@ -1,10 +1,12 @@
-from astropy.table import Table, Column
-
 from lsst.afw.image import ImageF, MaskX
+from lsst.afw.table import SourceTable
 from lsst.pex.config import ChoiceField, ConfigurableField
 from lsst.pipe.base import PipelineTask, PipelineTaskConfig, PipelineTaskConnections, Struct
 from lsst.pipe.base.connectionTypes import Input, Output
 
+from mixcoatl.streaks.detectStreaks import FrangiDetectTask, HessianDetectTask
+from mixcoatl.streaks.khtDetect import KHTDetectTask
+from mixcoatl.streaks.table import StreakAdapter
 
 class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument", "visit", "detector")):
     exposure = Input(
@@ -13,20 +15,24 @@ class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument
         storageClass="Exposure",
         dimensions=("instrument", "visit", "detector"),
     )
-    detected_lines = Output(
+    streaks = Output(
         doc="Lines detected in the input exposure.",
-        name="detected_lines",
-        storageClass="ArrowAstropy",  # what storageClass?
+        name="streaks",
+        storageClass="SourceCatalog",
         dimensions=("instrument", "visit", "detector"),
     )
-    detected = Output(
-        doc="detected",
+
+    # KHT exclusive outputs
+    edges = Output(
+        doc="Canny binary edge map.",
+        name="edges",
         storageClass="Mask",
-        dimensions
+        dimensions=("instrument", "visit", "detector"),
+    )
 
     # Frangi exclusive outputs
     vesselness = Output(
-        doc="Frangi vesselness image.",
+        doc="Frangi vesselness map.",
         name="vesselness",
         storageClass="Image",
         dimensions=("instrument", "visit", "detector"),
@@ -44,22 +50,25 @@ class StreakAnalysisConnections(PipelineTaskConnections, dimensions=("instrument
         super().__init__(config=config)
         if config.detection_algorithm != "hessian":
             del self.minima_ridges
-        if config.detection_algorithm !- "frangi":
+        if config.detection_algorithm != "frangi":
             del self.vesselness
-
+        if config.detection_algorithm != "kht":
+            del self.edges
 
 class StreakAnalysisConfig(PipelineTaskConfig, pipelineConnections=StreakAnalysisConnections):
     detection_algorithm = ChoiceField(
         dtype=str,
-        default="frangi",
+        default="kht",
         doc="Line detection algorithm to use.",
         allowed={
             "hessian": "Hessian matrix.",
-            "frangi" : "Multiscale Frangi vesselness.",
-            "kht" : "Kernel Hough transform.",
-            "radon" : "Matched filter Radon transform.",
+            "frangi": "Multiscale Frangi vesselness.",
+            "kht": "Kernel Hough transform.",
+            "radon": "Matched filter Radon transform.",
         },
     )
+
+    # Detector tasks
     frangi_detect = ConfigurableField(
         target=FrangiDetectTask,
         doc="Detect streaks using multiscale Frangi vesselness.",
@@ -81,17 +90,28 @@ class StreakAnalysisTask(PipelineTask):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.makeSubtask("detect_streaks")
+        
+
+        if self.config.detection_algorithm == "kht":
+            self.makeSubtask("kht_detect")
 
     def run(self, exposure):
 
+        schema = StreakAdapter.makeMinimalSchema()
+        table = SourceTable.make(schema)
+
         if self.config.detection_algorithm == "hessian":
-            detect_result = self.hessian_detect.run(exposure)
+            #detect_result = self.hessian_detect.run(exposure)
+            raise NotImplementedError("hessian detection not implemented")
+
         elif self.config.detection_algorithm == "frangi":
-            detect_result = self.frangi_detect.run(exposure)
+            #detect_result = self.frangi_detect.run(exposure)
+            raise NotImplementedError("frangi detection not implemented")
+
         elif self.config.detection_algorithm == "kht":
-            detect_results = self.kht_detect.run(exposure)
+            results = self.kht_detect.run(table, exposure)
+
         elif self.config.detection_algorithm == "radon":
             raise NotImplementedError("radon detection not implemented")
 
-        return Struct(streak_catalog=streak_catalog)
+        return results

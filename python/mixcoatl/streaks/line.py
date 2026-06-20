@@ -438,10 +438,15 @@ class LineSegment2D(LineGeometry2D):
         self._interval = interval
 
     @classmethod    
-    def from_center_length(cls, line: Line2D, u_center: float, length: float) -> Self:
+    def from_u_center_length(cls, line: Line2D, u_center: float, length: float) -> Self:
         h = 0.5 * length
         interval = geom.IntervalD.fromSpannedPoints((u_center - h, u_center + h))
         return cls(line, interval)
+
+    @classmethod
+    def from_center_length(cls, line: Line2D, center: geom.Point2D, length: float) -> Self:
+        h = 0.5 * length
+        u_center = line.at(project)
 
     @classmethod
     def from_points(cls, p0: geom.Point2D, p1: geom.Point2D) -> Self:
@@ -453,6 +458,14 @@ class LineSegment2D(LineGeometry2D):
     @property
     def line(self) -> Line2D:
         return self._line
+
+    @property
+    def rho(self) -> float:
+        return self._line.rho
+
+    @property
+    def theta(self) -> geom.Angle:
+        return self._line.theta
 
     @property
     def interval(self) -> geom.IntervalD:
@@ -475,7 +488,7 @@ class LineSegment2D(LineGeometry2D):
         return self.interval.min
 
     @property
-    def center(self) -> float:
+    def center(self) -> geom.Point2D:
         return self.at(self.u_center)
 
     @property
