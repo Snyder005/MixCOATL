@@ -1,7 +1,5 @@
-# Why mix type definitions in the schema? E.g. "I" vs np.int32?
 # Optional Upgrades:
-#   * Convenience geometric properties (center, length, p0, p1): 
-#     These may be useful for downstream analysis code/ML labeling
+#   * Convenience geometric properties (center, length, p0, p1):
 import numpy as np
 
 import lsst.afw.detection as afwDetect
@@ -16,7 +14,7 @@ class StreakAdapter:
         self._record = record
 
     def __repr__(self):
-        seg = self.line_segment
+        seg = self.getLineSegment()
 
         return (
             f"StreakAdapter("
@@ -40,7 +38,7 @@ class StreakAdapter:
 
     def getLineSegment(self) -> LineSegment2D:
         return LineSegment2D.from_center_length(
-            line=self.line,
+            line=self.getLine(),
             u_center=self["line_u_center"],
             length=self["line_length"],
         )

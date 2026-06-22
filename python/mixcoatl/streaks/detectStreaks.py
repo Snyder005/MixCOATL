@@ -1,428 +1,185 @@
-# Notes for optimization:
-#   * MAD may become extremely small on empty fields or diffims
-#   * Could add an adaptive gamma based off of percentile
-#   * Filtering of regions may be better using estimated fit RMS/aspect ratio
-#   * Computing bottleneck is the Hessian matrix per sigma due to image size
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import binary_dilation
-from scipy.stats import median_abs_deviation
-from skimage.feature import canny, hessian_matrix, hessian_matrix_eigvals
-from skimage.filters import frangi  # For Frangi
-from skimage.measure import label, regionprops
-from skimage.morphology import remove_small_objects
+from scipy.ndimage import distance_transform_edt
+from skimage.feature import canny
 from sklearn.cluster import KMeans
 
-import lsst.kht
+import lsst.afw.detection as afwDetect
+import lsst.afw.geom as afwGeom
+import lsst.afw.image as afwImage
+import lsst.afw.table as afwTable
 import lsst.geom as geom
-from lsst.afw.detection import Footprint
-from lsst.afw.geom import SpanSet
-from lsst.afw.image import ExposureF, MaskX
-from lsst.afw.table import SourceCatalog, SourceTable
-from lsst.pex.config import Config, Field, ListField
-from lsst.pipe.base import Struct, Task
-from mixcoatl.streaks.line import fit_line_segment_from_xy, Line2D
+import lsst.kht
+import lsst.pex.config as pexConfig
+import lsst.pipe.base as pipeBase
+from lsst.meas.algorithms.maskStreaks import Line, LineProfile
+from mixcoatl.streaks.line import Line2D
 from mixcoatl.streaks.table import StreakAdapter
 
 
-def get_bad_pixel_mask(
-    exposure: ExposureF,
-    bad_mask_planes: list[str],
-    npix_to_dilate: int = 8,
-) -> NDArray[np.bool]:
-    """Get a bad pixel mask."""
-    bad_mask_bits = exposure.mask.getPlaneBitMask(bad_mask_planes)
-    bad = (exposure.mask.array & bad_mask_bits) != 0
-    bad = binary_dilation(bad, iterations=max(1, npix_to_dilate))
-    
-    return bad
+def get_pixel_mask(mask: afwImage.Mask, mask_plane: str | list[str]) -> NDArray[bool]:
+    """Get pixel mask array corresponding to the mask planes.
+
+    Parameters
+    ----------
+    mask : `lsst.afw.image.Mask`
+        The input mask.
+    mask_plane : `str` or `list` [`str`]
+        Name or list of names of the mask plane.
+
+    Returns
+    -------
+    pixel_mask : `numpy.ndarray`, (Ny, Nx)
+        The pixel mask array.
+    """
+    pixel_mask = (mask.array & mask.getPlaneBitMask(mask_plane)) != 0
+    return pixel_mask
 
 
-def calculate_response_significance(
-    response: NDArray[np.float32],
-    invalid: NDArray[np.bool],
-    min_response: float | None = None,
-) -> tuple[NDArray[np.float32], float, float]:
+def binary_dilation(binary_image: NDArray[bool], npix_to_dilate: int) -> NDArray[bool]:
+    """Dilate a binary array with a circular structuring element.
 
-    valid = np.isfinite(response) & ~invalid
-    if min_response is not None:
-        valid &= (response > min_response)
+    Parameters
+    ----------
+    binary_image : `numpy.ndarray`, (Ny, Nx)
+        The input binary image array.
+    npix_to_dilate : `int`
+        The pixel radius of the circular structuring element to dilate by.
 
-    responses = response[valid]
-
-    if responses.size == 0:
-        raise ValueError("no valid points in the streak detector response")
-
-    median = np.median(responses)
-    sigma = median_abs_deviation(responses, scale="normal")
-    if sigma <= 0 or not np.isfinite(sigma):
-        sigma = np.std(valid)
-
-    if sigma <= 0 or not np.isfinite(sigma):
-        raise ValueError("streak detector response has no measurable dispersion")
-
-    significance = (response - median) / sigma
-    return significance, median, sigma
+    Returns
+    -------
+    dilated_image : `numpy.ndarray`, (Ny, Nx)
+        The dilated binary image array.
+    """
+    return distance_transform_edt(~binary_image) <= npix_to_dilate
 
 
-class FrangiDetectConfig(Config):
-    """Configurable parameters for `FrangiDetectTask`."""
-    # Configuration for masking
-    bad_mask_planes = ListField(
-        doc="Names of mask plane regions to ignore when doing streak detection.",
-        dtype=str,
-        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP", "SPIKE"],
-    )
-    npix_to_dilate = Field(
-        doc="Number of pixels to dilate the bad mask planes.",
-        dtype=int,
-        default=8,
-    )
-
-    # Configuration for Frangi filter
-    sigmas = ListField(
-        doc="Gaussian scale for multiscale Hessian matrix.",
-        dtype=float,
-        default=[1.0, 2.0, 4.0],
-    )
-    beta = Field(
-        doc="Frangi correction constant to adjust sensitivity to anisotropy.",
-        dtype=float,
-        default=0.5,
-    )
-    gamma = Field(
-        doc="Frangi correction constant to adjust sensitivity to structural strength.",
-        dtype=float,
-        default=3.0,
-    )
-
-    # Configuration for response thresholding
-    response_nsig = Field(
-        doc="Number of sigma for streak detector response thresholding.",
-        dtype=float,
-        default=5.0,
-    )
-    min_vesselness = Field(
-        doc="Minimum vesselness for threshold calculation.",
-        dtype=float,
-        default=1e-6,
-    )
-
-    # Configuration for detected regions
-    min_area = Field(
-        doc="Mininum pixel area of the detected regions.",
-        dtype=int,
-        default=81,
-    )
-    eccentricity = Field(
-        doc="Lower bound for the eccentricity of the detected regions.",
-        dtype=float,
-        default=0.98,
-    )
-
-
-class FrangiDetectTask(Task):
-    ConfigClass = FrangiDetectConfig
-    _DefaultName = "frangiDetect"
-
-    def run(self, exposure: ExposureF) -> Struct:
-
-        # Create a streak catalog
-        schema = StreakSchema.makeMinimalSchema()
-        schema.addField(
-            "line_rms",
-            type=np.float32,
-            doc="Weighted perpendicular RMS residual from line fit.",
-        )
-        schema.addField(
-            "aspect_ratio",
-            type=np.float32,
-            doc="Length divided by estimated width.",
-        )
-        table = SourceTable.make(schema)
-        catalog = SourceCatalog(table)
-
-        # Calculate weighted image
-        weighted_image = exposure.image.array / np.sqrt(np.maximum(exposure.variance.array, 1e-6))
-
-        # Suppress invalid pixels from bad mask planes
-        invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
-        weighted_image[invalid] = 0.0
-
-        # Calculate Frangi vesselness
-        vesselness = frangi(
-            weighted_image,
-            sigmas=self.config.sigmas,
-            alpha=0.5,
-            beta=self.config.beta,
-            gamma=self.config.gamma,
-            black_ridges=False,
-        )
-        vesselness[invalid] = 0.0
-
-        # Calculate background-normalized significance
-        significance, median, sigma = calculate_response_significance(
-            vesselness,
-            invalid,
-            min_response=self.config.min_vesselness,
-        )
-        binary = (significance > self.config.response_nsig)
-        binary[invalid] = False
-
-        # Connect pixel regions and add to catalog
-        detected = remove_small_objects(binary, max_size=self.config.min_area)
-        labels = label(detected, connectivity=2)
-        for region in regionprops(labels):
-            if region.eccentricity < self.config.eccentricity:
-                continue
-
-            coords = region.coords
-            ys = coords[:, 0]
-            xs = coords[:, 1]
-            weights = vesselness[ys, xs]
-            fit_result = fit_line_segment_from_xy(xs, ys, weights=weights)
-
-            footprint_mask = MaskX(np.zeros_like(detected, dtype=np.int32))
-            footprint_mask.array[ys, xs] = 1
-            spans = SpanSet.fromMask(footprint_mask)
-            footprint = Footprint(spans)
-
-            record = catalog.addNew()
-            streak = StreakAdapter(record)
-            streak.line_segment = fit_result.line_segment
-            streak["detector"] = exposure.detector.getId()
-            streak["line_rms"] = fit_result.rms
-            streak["aspect_ratio"] = fit_result.aspect_ratio
-            streak.footprint = footprint
-
-        return Struct(
-            streak_catalog=catalog,
-            significance=significance,
-            detected=detected,
-            response=vesselness,
-        )
-
-
-class HessianDetectConfig(Config):
-    """Configurable parameters for `HessianDetectClass`."""
-    # Configuration for masking
-    bad_mask_planes = ListField(
-        doc="Names of mask plane regions to ignore when doing streak detection.",
-        dtype=str,
-        default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP", "SPIKE"],
-    )
-    npix_to_dilate = Field(
-        doc="Number of pixels to dilate the bad mask planes.",
-        dtype=int,
-        default=8,
-    )
-
-    # Configuration for Hessian matrix
-    sigma = Field(
-        doc="Gaussian scale for Hessian matrix.",
-        dtype=float,
-        default=1.0,
-    )
-
-    # Configruation for response thresholding
-    response_nsig = Field(
-        doc="Number of sigma for thresholding of the streak detector response.",
-        dtype=float,
-        default=5.0,
-    )
-
-    # Configuration for detected regions
-    min_area = Field(
-        doc="Minimum pixel area of the detected regions.",
-        dtype=int,
-        default=81,
-    )
-    eccentricity = Field(
-        doc="Lower bound for the eccentricity of the detected regions.",
-        dtype=float,
-        default=0.98,
-    )
-    aspect_ratio = Field(
-        doc="Lower bound for the aspect ratio of the detected regions.",
-        dtype=float,
-        default=8.0,
-    )
-
-
-class HessianDetectTask(Task):
-    ConfigClass = HessianDetectConfig
-    _DefaultName = "hessianDetect"
-
-    def run(self, exposure: ExposureF) -> Struct:
-
-        # Create a streak catalog
-        schema = StreakSchema.makeMinimalSchema()
-        schema.addField(
-            "line_rms",
-            type=np.float32,
-            doc="Weighted perpendicular RMS residual from line fit.",
-        )
-        schema.addField(
-            "aspect_ratio",
-            type=np.float32,
-            doc="Length divided by estimated width.",
-        )
-        table = SourceTable.make(schema)
-        catalog = SourceCatalog(table)
-
-        # Calculate weighted image
-        weighted_image = exposure.image.array / np.sqrt(np.maximum(exposure.variance.array, 1e-6))
-
-        # Suppress invalid pixels from bad mask planes
-        invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
-        weighted_image[invalid] = 0.0
-
-        # Calculate Hessian eigenvalues
-        h_elems = hessian_matrix(
-            weighted_image,
-            sigma=self.config.sigma,
-            order="rc",
-            use_gaussian_derivatives=True,
-        )
-        h_elems = [self.config.sigma**2 * h for h in h_elems]
-        maxima_ridges, minima_ridges = hessian_matrix_eigvals(h_elems)
-        response = -minima_ridges
-        response[invalid] = 0.0
-
-        # Calculate background-normalized significance
-        significance, median, sigma = calculate_response_significance(response, invalid)
-        binary = significance > self.config.response_nsig
-        binary[invalid] = False
-
-        # Connect pixel regions and add to catalog
-        detected = remove_small_objects(binary, max_size=self.config.min_area)
-        labels = label(detected, connectivity=2)
-        for region in regionprops(labels):
-            if region.eccentricity < 0.98:
-                continue
-
-            coords = region.coords
-            ys = coords[:, 0]
-            xs = coords[:, 1]
-            weights = detected[ys, xs]
-            fit_result = fit_line_segment_from_xy(xs, ys, weights=weights)
-
-            if fit_result.aspect_ratio < self.config.aspect_ratio:
-                continue
-            
-            if not np.isfinite(fit_result.aspect_ratio):
-                continue
-
-            footprint_mask = MaskX(np.zeros_like(binary, dtype=np.int32))
-            footprint_mask.array[ys, xs] = 1
-            spans = SpanSet.fromMask(footprint_mask)
-            footprint = Footprint(spans)
-
-            record = catalog.addNew()
-            streak = StreakAdapter(record)
-            streak.line_segment = fit_result.line_segment
-            streak["detector"] = exposure.detector.getId()
-            streak["line_rms"] = fit_result.rms
-            streak["aspect_ratio"] = fit_result.aspect_ratio
-            streak.footprint = footprint
-
-        return Struct(
-            streak_catalog=catalog,
-            significance=significance,
-            detected=detected,
-            response=response,
-        )
-
-
-class KHTDetectConfig(Config):
+class KHTDetectConfig(pexConfig.Config):
     """Configurable parameters for `KHTDetectTask`."""
-    # Configuration for masking
-    detected_mask_plane = Field(
-        doc="Name of mask plane region with pixels above detection threshold.",
+    # Configuration for pixel masking
+    detected_mask_plane = pexConfig.Field(
+        doc="Name of mask plane with pixels above detection threshold.",
         dtype=str,
         default="DETECTED",
     )
-
-    # Configuration for masking
-    bad_mask_planes = ListField(
+    bad_mask_planes = pexConfig.ListField(
         doc="Names of mask plane regions to ignore when doing streak detection.",
         dtype=str,
         default=["NO_DATA", "INTRP", "BAD", "SAT", "EDGE", "ITL_DIP", "SPIKE"],
     )
-    npix_to_dilate = Field(
-        doc="Number of pixels to dilate the bad mask planes.",
+    saturated_detections_dilation = pexConfig.Field(
+        doc="Number of pixels to dilate the saturated detections mask.",
         dtype=int,
-        default=8,
+        default=250,
     )
 
-    # Configuration for Kernel Hough transform
-    cluster_minimum_size = Field(
+    # Configuration for KHT
+    cluster_minimum_size = pexConfig.Field(
         doc="Minimum size (in pixels) of detected clusters.",
         dtype=int,
         default=50,
     )
-    cluster_minimum_deviation = Field(
-        doc="Allowed deviation (in pixels) from a straight line for a detected line.",
+    cluster_minimum_deviation = pexConfig.Field(
+        doc="Allowed deviation (in pixels) from a straight line.",
         dtype=int,
         default=2,
     )
-    delta = Field(
+    delta = pexConfig.Field(
         doc="Stepsize in angle-radius parameter space.",
         dtype=float,
         default=0.2,
     )
-    minimum_kernel_height = Field(
+    minimum_kernel_height = pexConfig.Field(
         doc="Minimum height of the streak-finding kernel relative to the tallest kernel.",
         dtype=float,
         default=0.0,
     )
-    nsigma = Field(
+    nsigma = pexConfig.Field(
         doc="Number of sigma from center of kernel to include in voting procedure.",
         dtype=float,
         default=2.0,
     )
-    abs_minimum_kernel_height = Field(
+    abs_minimum_kernel_height = pexConfig.Field(
         doc="Minimum absolute height of the streak-finding kernel.",
         dtype=float,
         default=5.0,
     )
 
     # Configuration for clustering
-    rho_bin_size = Field(
-        doc="Binsize (in pixels) for position parameter when finding clusters of detected lines.",
+    rho_bin_size = pexConfig.Field(
+        doc="Binsize (in pixels) for position parameter when finding clusters.",
         dtype=float,
         default=40.0,
     )
-    theta_bin_size = Field(
-        doc="Binsize (in degrees) for angle parameter theta when finding clusters of detected lines.",
+    theta_bin_size = pexConfig.Field(
+        doc="Binsize (in degrees) for angle parameter when finding clusters.",
         dtype=float,
         default=2.0,
     )
 
+    # Configuration for profile fit
+    inv_sigma = pexConfig.Field(
+        doc="Inverse of the Moffat sigma parameter (in pixels) describing the streak profile.",
+        dtype=float,
+        default=10.**-1,
+    )
+    dchi2_tolerance = pexConfig.Field(
+        doc="Absolute difference in chi2 between fit iterations for convergence.",
+        dtype=float,
+        default=0.1,
+    )
+    max_fit_iter = pexConfig.Field(
+        doc="Maximum number of fit iterations acceptable for convergence.",
+        dtype=int,
+        default=100,
+    )
+    max_streak_width = pexConfig.Field(
+        doc="Maximum width (in pixels) of the streak mask.",
+        dtype=float,
+        default=0.0,
+    )
+    nsigma_mask = pexConfig.Field(
+        doc="Number of sigma from center of kernel to mask.",
+        dtype=float,
+        default=5.0,
+    )
+    footprint_threshold = pexConfig.Field(
+        doc="Threshold at which to determine the edge of line (in nanoJansky).",
+        dtype=float,
+        default=0.01,
+    )
 
-class KHTDetectTask(Task):
+
+class KHTDetectTask(pipeBase.Task):
     ConfigClass = KHTDetectConfig
     _DefaultName = "khtDetect"
 
-    def run(self, exposure: ExposureF) -> Struct:
+    def run(self, table: afwTable.SourceTable, exposure: afwImage.ExposureF) -> pipeBase.Struct:
 
-        # Create a streak catalog
-        schema = StreakSchema.makeMinimalSchema()
-        table = SourceTable.make(schema)
-        catalog = SourceCatalog(table)
-        
-        # Calculate weighted image
-        detected = exposure.mask.getPlaneBitMask(self.config.detected_mask_plane)
-        weighted_image = (exposure.mask.array & detected)
-
-        # Suppress invalid pixels from bad mask planes
-        invalid = get_bad_pixel_mask(exposure, self.config.bad_mask_planes, self.config.npix_to_dilate)
+        image = exposure.image.array
+        variance = exposure.variance.array
+        mask = exposure.mask
+        streaks = afwTable.SourceCatalog(table)
+        wcs = exposure.getWcs()
 
         # Calculate Canny edge response
-        edges = canny(weighted_image.astype(np.float64), use_quantiles=True, sigma=0.1)
-        edges[invalid] = False
+        detected_mask = get_pixel_mask(mask, self.config.detected_mask_plane)
+        init_edges = canny(detected_mask.astype(np.float64), use_quantiles=True, sigma=0.1)
 
-        # Detect and cluster lines
+        # Mask invalid regions
+        bad_mask = binary_dilation(get_pixel_mask(mask, self.config.bad_mask_planes), 1)
+        if self.config.saturated_detections_dilation:
+            sat_mask = get_pixel_mask(mask, "SAT")
+            sat_detected_mask = binary_dilation(
+                sat_mask & detected_mask,
+                self.config.saturated_detections_dilation,
+            )
+            invalid = sat_detected_mask | bad_mask
+        else:
+            invalid = bad_mask
+        edges = init_edges & ~invalid
+
+        # Run KHT
         lines = lsst.kht.find_lines(
             edges,
             self.config.cluster_minimum_size,
@@ -432,22 +189,61 @@ class KHTDetectTask(Task):
             self.config.nsigma,
             self.config.abs_minimum_kernel_height,
         )
+        if lines.size == 0:
+            return pipeBase.Struct(
+                streak_catalog=catalog,
+                detected=edges,
+            )
+
         rhos, thetas = self._cluster_lines(lines.rho, lines.theta)
+        
+        # Fit Profile
+        weights = variance**-1
+        weights[~np.isfinite(weights) | ~np.isfinite(image)] = 0
+        weights[bad_mask] = 0
 
         box = exposure.detector.getBBox()
         shift = box.getCenter().asExtent()
-
         for rho, theta in np.nditer((rhos, thetas)):
-            kht_line = Line2D(rho, theta * geom.degrees)
-            det_line = kht_line.translated(shift)
-            
-            record = catalog.addNew()
-            streak = StreakAdapter(record)
-            streak.line_segment = det_line.intersection(box)
+            line = Line(rho, theta, sigma=self.config.inv_sigma**-1)
+            line_model = LineProfile(image, weights, line=line, detectionMask=detected_mask)
+            if line_model.modelFailure or line_model.lineMask.sum() == 0:
+                continue
 
-        return Struct(
-            streak_catalog=catalog,
-            detected=edges,
+            fit, failure = line_model.fit(self.config.dchi2_tolerance, maxIter=self.config.max_fit_iter)
+
+            if ((abs(fit.rho - line.rho) > 2 * self.config.rho_bin_size) or 
+                (abs(fit.theta - line.theta) > 2 * self.config.theta_bin_size)):
+                failure = True
+
+            if failure:
+                continue
+
+            line_model.setLineMask(fit, self.config.max_streak_width, self.config.nsigma_mask)
+            final_model = line_model.makeProfile(fit)
+            final_line_mask = abs(final_model) > self.config.footprint_threshold
+            if not final_line_mask.any():
+                continue
+
+            kht_line = Line2D(fit.rho, fit.theta * geom.degrees)
+            det_line = kht_line.translated(shift)
+            line_segment = det_line.intersection(box)
+            center = line_segment.center
+
+            footprint_mask = afwImage.Mask(final_line_mask.astype(np.int32))
+            spans = afwGeom.SpanSet.fromMask(footprint_mask)
+            footprint = afwDetect.Footprint(spans)
+
+            streak = StreakAdapter(streaks.addNew())
+            streak.setLineSegment(line_segment)
+            streak.setFootprint(footprint)
+            streak.setCoord(wcs.pixelToSky(center))
+            streak["line_center_x"] = center.getX()
+            streak["line_center_y"] = center.getY()
+
+        return pipeBase.Struct(
+            streaks=streaks,
+            edges=edges,
         )
 
     def _cluster_lines(
@@ -455,7 +251,7 @@ class KHTDetectTask(Task):
         rhos: NDArray[np.float64],
         thetas: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Cluster lines by recursive kmeans clustering."""
+        """Cluster lines by recursive k-means clustering."""
         x = rhos / self.config.rho_bin_size
         y = thetas / self.config.theta_bin_size
         points = np.column_stack((x, y))
@@ -475,7 +271,7 @@ class KHTDetectTask(Task):
         
         final_clusters = kmeans.cluster_centers_.T
         
-        final_rhos = final_clusters[0] * self.config.rho_bin_size
-        final_thetas = final_clusters[1] * self.config.theta_bin_size
+        rhos = final_clusters[0] * self.config.rho_bin_size
+        thetas = final_clusters[1] * self.config.theta_bin_size
 
-        return final_rhos, final_thetas
+        return rhos, thetas

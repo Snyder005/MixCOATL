@@ -1,0 +1,7 @@
+description: mixcoatl streak analysis
+tasks:
+  streakAnalysis:
+    class: mixcoatl.streaks.streakAnalysis.StreakAnalysisTask
+    config:
+      connections.exposure: 'difference_image'
+      detection_algorithm: "kht"
